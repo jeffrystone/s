@@ -26,3 +26,7 @@ params_forbidden_by_scars(::AbstractTask, params::Dict{Symbol, Any}, scars::Vect
 function failure_scar_meta(::AbstractTask, params::Dict{Symbol, Any})
     return (Dict{Symbol,Any}(:sig => UInt64(objectid(params))), 0.01, 3, 0.01)
 end
+
+function eval_cache_key(::AbstractTask, ::Dict{Symbol, Any}, ::Type{<:MetricLevel})::Union{Nothing, UInt64}
+    return nothing
+end

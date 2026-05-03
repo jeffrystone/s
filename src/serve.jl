@@ -44,6 +44,14 @@ function symbolize_params!(dst::Dict{Symbol, Any}, raw::AbstractDict)
     dst
 end
 
+function coerce_json_uint64(val)::Union{Nothing, UInt64}
+    val === nothing && return nothing
+    val isa UInt64 && return val
+    val isa AbstractString && return parse(UInt64, String(val))
+    val isa Integer && return UInt64(val)
+    return UInt64(round(Int, Float64(val)))
+end
+
 function manual_payload_from_json(s::AbstractString)::Dict{Symbol, Any}
     d = JSON3.read(s, Dict{String,Any})
     out = Dict{Symbol,Any}()
@@ -55,6 +63,13 @@ function manual_payload_from_json(s::AbstractString)::Dict{Symbol, Any}
     end
     haskey(d, "hp") && (out[:hp] = Float64(get(d, "hp", 0)))
     haskey(d, "mp") && (out[:mp] = Float64(get(d, "mp", 0)))
+    haskey(d, "node_id") && (out[:node_id] = coerce_json_uint64(get(d, "node_id", nothing)))
+    haskey(d, "node_a") && (out[:node_a] = coerce_json_uint64(get(d, "node_a", nothing)))
+    haskey(d, "node_b") && (out[:node_b] = coerce_json_uint64(get(d, "node_b", nothing)))
+    haskey(d, "scar_id") && (out[:scar_id] = coerce_json_uint64(get(d, "scar_id", nothing)))
+    haskey(d, "scar_index") &&
+        (out[:scar_index] = round(Int, Float64(get(d, "scar_index", 1))))
+    haskey(d, "frozen") && (out[:frozen] = Bool(get(d, "frozen", true)))
     return out
 end
 

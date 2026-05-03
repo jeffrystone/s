@@ -3,11 +3,11 @@ using Random
 """Pollard rho и быстрые эвристики для факторизации."""
 struct PollardFactoringTask <: AbstractTask
     l5_max_iter::Int
+    l5_walltime_s::Float64
     crossover_ops::Vector{Symbol}
 end
-
-PollardFactoringTask(; l5_max_iter::Int = 100_000) =
-    PollardFactoringTask(l5_max_iter, [:swap_start, :swap_coeff, :average, :random_mid])
+PollardFactoringTask(; l5_max_iter::Int = 100_000, l5_walltime_s::Float64 = 0.0) =
+    PollardFactoringTask(l5_max_iter, l5_walltime_s, [:swap_start, :swap_coeff, :average, :random_mid])
 
 supports_embed(::PollardFactoringTask)::Bool = true
 
@@ -30,14 +30,28 @@ function params_forbidden_by_scars(::PollardFactoringTask, params::Dict{Symbol, 
     false
 end
 
-"""Мутирует `params[:_factor]` при успехе."""
-function pollard_attempt!(params::Dict{Symbol, Any}, N::BigInt, start_x::BigInt, coeff::BigInt, max_iter::Int)::Tuple{Bool, Float64}
+function eval_cache_key(::PollardFactoringTask, p::Dict{Symbol, Any}, ::Type{L})::Union{Nothing, UInt64} where L<:MetricLevel
+    UInt64(hash((get(p, :N, nothing), get(p, :start_x, nothing), get(p, :poly_coeff, nothing), L)))
+end
+
+"""Мутирует `params[:_factor]` при успехе; проверка `deadline` каждые ~256 итераций."""
+function pollard_attempt!(
+    params::Dict{Symbol, Any},
+    N::BigInt,
+    start_x::BigInt,
+    coeff::BigInt,
+    max_iter::Int;
+    deadline = nothing,
+)::Tuple{Bool, Float64}
     delete!(params, :_factor)
     N <= BigInt(3) && return (false, 1.0)
     x::BigInt = mod(start_x, N)
     y::BigInt = x
     oneb = BigInt(1)
-    for _ = 1:max_iter
+    for iter = 1:max_iter
+        if deadline !== nothing && (iter % 256 == 0) && time() > deadline
+            return (false, 0.91)
+        end
         x = mod(x * x + coeff, N)
         y1 = mod(y * y + coeff, N)
         y = mod(y1 * y1 + coeff, N)
@@ -92,7 +106,8 @@ function evaluate(task::PollardFactoringTask, params::Dict{Symbol, Any}, ::Type{
     Nval = big(get(params, :N, 1))
     sx = BigInt(get(params, :start_x, 2))
     c = BigInt(get(params, :poly_coeff, 1))
-    ok, raw = pollard_attempt!(params, Nval, sx, c, task.l5_max_iter)
+    dl = task.l5_walltime_s > 0 ? Base.time() + task.l5_walltime_s : nothing
+    ok, raw = pollard_attempt!(params, Nval, sx, c, task.l5_max_iter; deadline = dl)
     ok && return (0.0, true)
     return (raw, false)
 end

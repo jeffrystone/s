@@ -1,10 +1,20 @@
 using Random
 using LinearAlgebra: dot, norm
-using Statistics: mean
+using Statistics: mean, cor, std
 using DataStructures: isempty, PriorityQueue
+using NearestNeighbors: KDTree, knn
 
 """Planner and simulation helpers (cold start, shots, resonance, analysis). ASCII comments."""
 const _LEVELS = (L1, L2, L3, L4, L5)
+
+function event_time_symbol(t::EventType)::Symbol
+    t === SHOT && return :shot
+    t === HEAVY_SHOT && return :heavy_shot
+    t === RESONANCE && return :resonance
+    t === ANALYSIS && return :analysis
+    t === MANUAL && return :manual
+    return :unknown
+end
 
 function recompute_D!(node::Node, mw::AbstractVector)
     node.D = clamp(dot(mw, node.metric_components), 0.0, 1.0)
@@ -24,6 +34,23 @@ function warm_start!(task::AbstractTask, node::Node, settings::Settings)
     mw = Vector{Float64}(settings.metric_weights)
     apply_metric_once!(task, node, L1, mw; record = false)
     apply_metric_once!(task, node, L2, mw; record = false)
+end
+
+function eval_maybe_cached(task::AbstractTask, env::Environment, st::Settings, params::Dict{Symbol, Any}, ::Type{L}) where {L}
+    key = eval_cache_key(task, params, L)
+    if !(st.evaluate_cache_enabled && key !== nothing)
+        return evaluate(task, params, L)
+    end
+    k = UInt64(key)
+    haskey(env.eval_cache, k) && return env.eval_cache[k]
+    out = evaluate(task, params, L)
+    while length(env.eval_cache) >= st.evaluate_cache_max && !isempty(env.eval_cache_order)
+        old = popfirst!(env.eval_cache_order)
+        delete!(env.eval_cache, old)
+    end
+    env.eval_cache[k] = out
+    push!(env.eval_cache_order, k)
+    return out
 end
 
 effcost(settings::Settings, k::Int, cold::Bool) =
@@ -49,6 +76,54 @@ end
 
 scar_potential(s::Scar, t::UInt64) =
     max(0.0, s.potential * exp(-s.decay_rate * Float64(max(t, s.last_update) - s.last_update)))
+
+function push_metric_l34_pair!(env::Environment, st::Settings, n3::Float64, n4::Float64)
+    push!(env.metric_l34_n3, clamp(n3, 0.0, 1.0))
+    push!(env.metric_l34_n4, clamp(n4, 0.0, 1.0))
+    cap = max(4, st.analysis_calibration_buffer_max)
+    while length(env.metric_l34_n3) > cap
+        popfirst!(env.metric_l34_n3)
+        popfirst!(env.metric_l34_n4)
+    end
+end
+
+"""§4.5: корреляция пар L3 vs L4 и перекос между уровнями → подстройка `metric_weights[3:4]`."""
+function maybe_calibration_l34_weights!(env::Environment, st::Settings)
+    nw = env.metric_weights
+    n3v = env.metric_l34_n3
+    n4v = env.metric_l34_n4
+    length(n3v) == length(n4v) || return
+    length(n3v) < st.analysis_calibration_min_samples && return
+
+    n3 = copy(n3v)
+    n4 = copy(n4v)
+    σ3 = std(n3)
+    σ4 = std(n4)
+    ρ = (σ3 < 1e-8 || σ4 < 1e-8) ? 0.0 : Float64(cor(n3, n4))
+    ρ = clamp(ρ, -1.0, 1.0)
+    g = mean(Float64.(n4) .- Float64.(n3))
+    η = st.analysis_calibration_eta
+    gt = st.analysis_calibration_gap_threshold
+
+    if g > gt
+        nw[3] = max(0.0, nw[3] * (1.0 - η * min(g / max(gt * 4, 0.03), 1.0)))
+        nw[4] *= (1.0 + 0.55 * η * min(g / max(gt * 4, 0.03), 1.0))
+    elseif g < -gt
+        nw[3] *= (1.0 + 0.55 * η * min((-g) / max(gt * 4, 0.03), 1.0))
+        nw[4] = max(0.0, nw[4] * (1.0 - 0.55 * η * min((-g) / max(gt * 4, 0.03), 1.0)))
+    end
+
+    if ρ >= st.analysis_calibration_corr_strong
+        nw[3] *= (1.0 + 0.35 * η * min((ρ - st.analysis_calibration_corr_strong) / max(1.0 - st.analysis_calibration_corr_strong, 0.05), 1.0))
+        nw[4] = max(0.0, nw[4] * (1.0 - 0.2 * η))
+    elseif ρ <= -st.analysis_calibration_corr_strong
+        nw[3] = max(0.0, nw[3] * (1.0 - 0.35 * η * min((-ρ - st.analysis_calibration_corr_strong) / max(1.0 - st.analysis_calibration_corr_strong, 0.05), 1.0)))
+        nw[4] *= (1.0 + 0.2 * η)
+    end
+
+    sm = sum(nw)
+    sm > 0 && (nw ./= sm)
+end
 
 function strong_scar_near(task::AbstractTask, env::Environment, node::Node)
     supports_embed(task) || return false
@@ -97,7 +172,7 @@ function pick_partner(task::AbstractTask, env::Environment, a::UInt64, cand::Vec
             use_emb && !isempty(va) ? st.attention_alpha * norm(va - embed(task, nb.params)) :
             rand(rng)
         suf = rand(rng) * st.attention_beta
-        jitter = randn(rng) * n_amp * 0.15
+        jitter = randn(rng) * n_amp * 0.15 * (env.stuck_counter > 0 ? st.resonance_stuck_jitter_amp : 1.0)
         sc = dist + suf + dmem + jitter
         if sc < bests
             bests = sc
@@ -105,6 +180,33 @@ function pick_partner(task::AbstractTask, env::Environment, a::UInt64, cand::Vec
         end
     end
     best
+end
+
+function pick_partner_kdtree(task::AbstractTask, env::Environment, a::UInt64, cand::Vector{UInt64}, rng::AbstractRNG, st::Settings)::UInt64
+    na = fetch_node(env.nodes, a)
+    @assert na !== nothing && !isempty(cand)
+    va = embed(task, na.params)
+    dlen = length(va)
+    isempty(va) && return pick_partner(task, env, a, cand, rng, st)
+
+    cols = Vector{Float64}[]
+    idmap = UInt64[]
+    for bid in cand
+        nb = fetch_node(env.nodes, bid)
+        nb === nothing && continue
+        e = embed(task, nb.params)
+        length(e) == dlen || continue
+        push!(cols, Float64[e[i] for i = 1:dlen])
+        push!(idmap, bid)
+    end
+    isempty(cols) && return cand[rand(rng, 1:length(cand))]
+    pts = reduce(hcat, cols)
+    tree = KDTree(pts)
+    kq = min(st.kdtree_nn, size(pts, 2))
+    idxs, _ = knn(tree, va, kq, true)
+    sub = UInt64[idmap[i] for i in idxs]
+    isempty(sub) && return pick_partner(task, env, a, cand, rng, st)
+    return pick_partner(task, env, a, sub, rng, st)
 end
 
 function wsample(rng::AbstractRNG, ops::Vector{Symbol}, wt::Vector{Float64})::Symbol
@@ -124,9 +226,9 @@ function offspring_n(hpA::Float64, mpB::Float64)::Int
     clamp(round(Int, log(2 + hpA) * sqrt(max(mpB, 0.01))), 1, 36)
 end
 
-function ll_score(task::AbstractTask, ch::Dict{Symbol, Any}, mw::Vector{Float64})::Float64
-    r1, _ = evaluate(task, ch, L1)
-    r2, _ = evaluate(task, ch, L2)
+function ll_score(task::AbstractTask, ch::Dict{Symbol, Any}, mw::Vector{Float64}, env::Environment, st::Settings)::Float64
+    r1, _ = eval_maybe_cached(task, env, st, ch, L1)
+    r2, _ = eval_maybe_cached(task, env, st, ch, L2)
     delete!(ch, :_factor)
     return mw[1] * normalize(task, L1, r1) + mw[2] * normalize(task, L2, r2)
 end
@@ -183,7 +285,7 @@ function analysis_pass!(env::Environment, task::AbstractTask, st::Settings; rng:
         if p > st.scar_eps
             push!(
                 newsc,
-                Scar(copy(s.center), s.radius, p, s.fail_level, s.decay_rate, tnow),
+                Scar(s.id, copy(s.center), s.radius, p, s.fail_level, s.decay_rate, tnow),
             )
         end
     end
@@ -232,7 +334,10 @@ function analysis_pass!(env::Environment, task::AbstractTask, st::Settings; rng:
         n.D < 0.2 && rupture_scars!(env, task, n, st)
     end
 
-    if !isempty(env.nodes) && rand(rng) < 0.08
+    if length(env.metric_l34_n3) >= st.analysis_calibration_min_samples &&
+       length(env.metric_l34_n3) == length(env.metric_l34_n4)
+        maybe_calibration_l34_weights!(env, st)
+    elseif !isempty(env.nodes) && rand(rng) < 0.02
         mw = env.metric_weights
         mw[3] *= 0.99
         mw[4] *= 1.005
@@ -295,7 +400,19 @@ function rebuild_schedule!(
         if !cold && na.hp > 1 && na.mp > 0 && !na.mp_frozen
             cand = res_candidates(env, na.id)
             if !isempty(cand)
+                tick_u = env.tick
+                rebuild_kdtree =
+                    st.use_kdtree_resonance &&
+                    supports_embed(task) &&
+                    length(cand) >= 3 &&
+                    (tick_u == UInt64(0) ||
+                     tick_u - env.kdtree_tick_built >= UInt64(st.kdtree_rebuild_ticks))
                 bid =
+                    rebuild_kdtree ? begin
+                        b = pick_partner_kdtree(task, env, na.id, cand, rng, st)
+                        env.kdtree_tick_built = tick_u
+                        b
+                    end :
                     supports_embed(task) ?
                     pick_partner(task, env, na.id, cand, rng, st) :
                     cand[rand(rng, 1:length(cand))]
@@ -329,48 +446,73 @@ function handle_shot!(env::Environment, task::AbstractTask, st::Settings, ev::Ev
     lk = choose_shot_level(na, st, cold)
     lk === nothing && return
 
-    appeal_l34!(task, env, na, st, lk, cold)
+    n_pred =
+        lk <: L4 && !cold ? begin
+            p0 = Dict{Symbol, Any}(pairs(na.params))
+            r3, _ = evaluate(task, p0, L3)
+            normalize(task, L3, r3)
+        end : nothing
 
     apply_metric_once!(task, na, lk, env.metric_weights; record = true)
+    if lk <: L4 && !cold && n_pred !== nothing
+        push_metric_l34_pair!(
+            env,
+            st,
+            Float64(n_pred),
+            Float64(na.metric_components[4]),
+        )
+    end
     k = level_index(lk)
     na.hp = max(0.0, na.hp - effcost(st, k, cold))
+    lk <: L4 && appeal_post_l4!(task, env, na, st, cold, n_pred)
     rupture_scars!(env, task, na, st)
 end
 
-"""If L4 looks much worse than a fresh cheap L3 re-check, pay for L5 one-off or trim metric_weights (stub)."""
-function appeal_l34!(
+"""Расхождение L3-vs-L4 после L4 (агент §4.2)."""
+function appeal_post_l4!(
     task::AbstractTask,
     env::Environment,
     na::Node,
     st::Settings,
-    lk::Type{<:MetricLevel},
     cold::Bool,
+    n_pred::Union{Nothing, Float64},
 )
-    !(lk <: L4) && return
     cold && return
-    if na.hp < effcost(st, 5, false) + 5.0
-        return
-    end
-    p0 = Dict{Symbol, Any}(pairs(na.params))
-    r3, _ = evaluate(task, copy(p0), L3)
-    n3 = normalize(task, L3, r3)
-    r5, succ = evaluate(task, copy(p0), L5)
-    delete!(p0, :_factor)
-    if succ || r5 <= 0.25
-        return
-    end
-    n5 = normalize(task, L5, r5)
-    gap = max(0.0, n5 - n3)
-    gap < 0.25 && return
+    n_pred === nothing && return
+    !st.appeal_l3_vs_l4 && return
+    n4 = na.metric_components[4]
+    (n_pred <= st.appeal_l3_threshold && n4 >= st.appeal_l4_threshold) || return
+    gap = n4 - n_pred
+    gap < st.appeal_min_gap && return
 
     mw = env.metric_weights
-    if gap > 0.45 && mw[3] > 1e-3
+
+    if st.appeal_use_l5_recheck
+        if na.hp < effcost(st, 5, false) + 1.0
+            return
+        end
+        p5 = Dict{Symbol, Any}(pairs(na.params))
+        raw5, succ = eval_maybe_cached(task, env, st, p5, L5)
+        delete!(na.params, :_factor)
+        if succ
+            na.metric_components[5] = normalize(task, L5, raw5)
+            recompute_D!(na, mw)
+            env.stop_reason = :factor_found
+            return
+        end
+        na.metric_components[5] = normalize(task, L5, raw5)
+        recompute_D!(na, mw)
+        na.hp = max(0.0, na.hp - effcost(st, 5, false))
+        return
+    end
+
+    if gap >= 0.45 && mw[3] > 1e-3
         mw[3] = max(0.0, mw[3] * 0.97)
         s = sum(mw)
         s > 0 && (mw ./= s)
-        na.hp = max(0.0, na.hp - 60.0)
+        na.hp = max(0.0, na.hp - st.appeal_hp_cost_heavy)
     else
-        na.hp = max(0.0, na.hp - 90.0)
+        na.hp = max(0.0, na.hp - st.appeal_hp_cost_light)
     end
 end
 
@@ -400,7 +542,9 @@ function handle_heavy_shot!(env::Environment, task::AbstractTask, st::Settings, 
         na.resonance_win_streak = 0
         if UInt64(env.tick) >= UInt64(st.cold_start_ticks)
             c, radius, fail_l, decay = failure_scar_meta(task, na.params)
-            push!(env.scars, Scar(c, radius, 1.0, fail_l, decay, UInt64(env.tick)))
+            sid = env.next_scar_id
+            env.next_scar_id += UInt64(1)
+            push!(env.scars, Scar(sid, c, radius, 1.0, fail_l, decay, UInt64(env.tick)))
         end
     end
     rupture_scars!(env, task, na, st)
@@ -411,20 +555,15 @@ function child_outperforms_parents(childD::Float64, da::Float64, db::Float64)::B
     childD < avg || childD <= min(da, db) + 0.05
 end
 
-function handle_resonance!(
+"""Тело скрещивания родителей `na` и `nb`; вызывается из события RESONANCE или MANUAL."""
+function perform_resonance_between!(
     env::Environment,
     task::AbstractTask,
     st::Settings,
-    ev::Event;
+    na::Node,
+    nb::Node,
     rng::AbstractRNG,
-)
-    na = fetch_node(env.nodes, ev.node_id)
-    nb = fetch_node(env.nodes, ev.partner_id)
-    (na === nothing || nb === nothing) && return
-
-    cand = res_candidates(env, na.id)
-    ev.partner_id ∈ cand || return
-
+)::Nothing
     ops =
         isempty(env.crossover_weights) ? [:swap_start, :swap_coeff, :average, :random_mid] :
         Symbol[k for (k, _) in env.crossover_weights]
@@ -443,7 +582,7 @@ function handle_resonance!(
         ch = crossover(task, na.params, nb.params, op; rng = rng)
         params_forbidden_by_scars(task, ch, env.scars) && continue
         chi = Dict{Symbol, Any}(pairs(ch))
-        sc = ll_score(task, chi, mw)
+        sc = ll_score(task, chi, mw, env, st)
         if sc < best_score
             best_score = sc
             best = chi
@@ -472,7 +611,7 @@ function handle_resonance!(
 
     improving = child_outperforms_parents(ch_node.D, na.D, nb.D)
 
-    rk = (min(ev.node_id, ev.partner_id), max(ev.node_id, ev.partner_id))
+    rk = (min(na.id, nb.id), max(na.id, nb.id))
     mv = get(env.resonance_memory, rk, 0.45)
     if improving
         na.resonance_win_streak += 1
@@ -483,6 +622,24 @@ function handle_resonance!(
     else
         env.resonance_memory[rk] = clamp(mv - 0.04, 0.0, 1.0)
     end
+    return
+end
+
+function handle_resonance!(
+    env::Environment,
+    task::AbstractTask,
+    st::Settings,
+    ev::Event;
+    rng::AbstractRNG,
+)
+    na = fetch_node(env.nodes, ev.node_id)
+    nb = fetch_node(env.nodes, ev.partner_id)
+    (na === nothing || nb === nothing) && return
+
+    cand = res_candidates(env, na.id)
+    ev.partner_id ∈ cand || return
+
+    perform_resonance_between!(env, task, st, na, nb, rng)
 end
 
 function handle_analysis_evt!(env::Environment, task::AbstractTask, st::Settings; rng::AbstractRNG = Random.default_rng())
@@ -496,17 +653,100 @@ function handle_manual!(
     ev::Event;
     rng::AbstractRNG,
 )
-    Symbol(get(ev.payload, :action, :noop)) === :add_node || return
-    raw_params = get(ev.payload, :params, nothing)
-    raw_params === nothing && return
-    p::Dict{Symbol, Any} = Dict{Symbol, Any}(pairs(raw_params))
-    hp = Float64(get(ev.payload, :hp, st.default_hp))
-    mp = Float64(get(ev.payload, :mp, st.default_mp))
-    nid = env.next_id
-    env.next_id += UInt64(1)
-    n = Node(nid, p; hp = hp, mp = mp)
-    warm_start!(task, n, st)
-    push!(env.nodes, n)
+    pl = ev.payload
+    act = Symbol(get(pl, :action, :noop))
+
+    function as_u64(x)::UInt64
+        x isa UInt64 && return x
+        x isa AbstractString && return parse(UInt64, String(x))
+        x isa Integer && return UInt64(x)
+        return UInt64(round(Int, Float64(x)))
+    end
+
+    if act === :add_node
+        raw_params = get(pl, :params, nothing)
+        raw_params === nothing && return
+        p::Dict{Symbol, Any} = Dict{Symbol, Any}(pairs(raw_params))
+        hp = Float64(get(pl, :hp, st.default_hp))
+        mp = Float64(get(pl, :mp, st.default_mp))
+        nid = env.next_id
+        env.next_id += UInt64(1)
+        n = Node(nid, p; hp = hp, mp = mp)
+        warm_start!(task, n, st)
+        push!(env.nodes, n)
+        return
+    end
+
+    if act === :delete_node
+        v = get(pl, :node_id, nothing)
+        v === nothing && return
+        nid = as_u64(v)
+        i = findfirst(n -> n.id == nid, env.nodes)
+        i === nothing && return
+        victim = env.nodes[i]
+        c, radius, fail_l, decay = failure_scar_meta(task, victim.params)
+        sid = env.next_scar_id
+        env.next_scar_id += UInt64(1)
+        push!(
+            env.scars,
+            Scar(
+                sid,
+                c,
+                radius,
+                0.45,
+                min(fail_l, 4),
+                decay,
+                UInt64(env.tick),
+            ),
+        )
+        deleteat!(env.nodes, i)
+        return
+    end
+
+    if act === :force_resonance
+        va = get(pl, :node_a, nothing)
+        vb = get(pl, :node_b, nothing)
+        (va === nothing || vb === nothing) && return
+        ida = as_u64(va)
+        idb = as_u64(vb)
+        na = fetch_node(env.nodes, ida)
+        nb = fetch_node(env.nodes, idb)
+        (na === nothing || nb === nothing) && return
+        ida == idb && return
+        na.hp > 0.5 || return
+        na.mp > 0 || return
+        nb.mp > 0 || return
+        perform_resonance_between!(env, task, st, na, nb, rng)
+        return
+    end
+
+    if act === :clear_scar
+        if haskey(pl, :scar_id)
+            sid = as_u64(pl[:scar_id])
+            k = findfirst(s -> s.id == sid, env.scars)
+            k === nothing && return
+            deleteat!(env.scars, k)
+            return
+        end
+        ix = get(pl, :scar_index, nothing)
+        ix === nothing && return
+        j = Int(ix)
+        (j < 1 || j > length(env.scars)) && return
+        deleteat!(env.scars, j)
+        return
+    end
+
+    if act === :set_mp_frozen
+        v = get(pl, :node_id, nothing)
+        v === nothing && return
+        nid = as_u64(v)
+        n = fetch_node(env.nodes, nid)
+        n === nothing && return
+        n.mp_frozen = Bool(get(pl, :frozen, true))
+        return
+    end
+
+    return
 end
 
 function drain_manual!(
@@ -535,6 +775,7 @@ function step!(env::Environment, task::AbstractTask, st::Settings; rng::Abstract
     pr = Base.popfirst!(env.event_queue)
     ev, _ = pr.first
 
+    t0 = time()
     if ev.type == SHOT
         handle_shot!(env, task, st, ev)
     elseif ev.type == HEAVY_SHOT
@@ -545,6 +786,12 @@ function step!(env::Environment, task::AbstractTask, st::Settings; rng::Abstract
         handle_analysis_evt!(env, task, st; rng)
     elseif ev.type == MANUAL
         handle_manual!(env, task, st, ev; rng)
+    end
+    dt = time() - t0
+    sym = event_time_symbol(ev.type)
+    env.event_time_s[sym] = get(env.event_time_s, sym, 0.0) + dt
+    if ev.node_id != UInt64(0)
+        env.per_node_time_s[ev.node_id] = get(env.per_node_time_s, ev.node_id, 0.0) + dt
     end
 
     env.tick += UInt64(1)
@@ -603,6 +850,14 @@ function build_environment(
         Float64[],
         0,
         :running,
+        Dict{Symbol, Float64}(),
+        Dict{UInt64, Float64}(),
+        Dict{UInt64, Tuple{Float64, Bool}}(),
+        UInt64[],
+        UInt64(0),
+        UInt64(1),
+        Float64[],
+        Float64[],
     )
 
     env

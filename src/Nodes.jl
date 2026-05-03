@@ -33,7 +33,10 @@ export Node,
        state_snapshot,
        snapshot_json,
        start_dashboard,
-       greet
+       greet,
+       push_metric_l34_pair!,
+       maybe_calibration_l34_weights!,
+       drain_manual!
 
 include("types.jl")
 include("config.jl")

@@ -65,6 +65,7 @@ function Node(id::UInt64, params::Dict{Symbol, Any}; hp::Float64, mp::Float64, D
 end
 
 struct Scar
+    id::UInt64
     center::Dict{Symbol, Any}
     radius::Float64
     potential::Float64
@@ -90,6 +91,14 @@ mutable struct Environment
     d_history::Vector{Float64}
     stuck_counter::Int
     stop_reason::Symbol
+    event_time_s::Dict{Symbol, Float64}
+    per_node_time_s::Dict{UInt64, Float64}
+    eval_cache::Dict{UInt64, Tuple{Float64, Bool}}
+    eval_cache_order::Vector{UInt64}
+    kdtree_tick_built::UInt64
+    next_scar_id::UInt64
+    metric_l34_n3::Vector{Float64}
+    metric_l34_n4::Vector{Float64}
 end
 
 """Индекс 1..5 для весов метрик (L1..L5)."""

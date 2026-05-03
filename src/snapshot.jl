@@ -36,6 +36,7 @@ end
 
 function serialize_scar(s::Scar, tick::UInt64)
     (
+        id = UInt64(s.id),
         center = json_safe(Dict(pairs(s.center))),
         radius = s.radius,
         potential = scar_potential(s, tick),
@@ -55,6 +56,11 @@ function state_snapshot(env::Environment)::Dict{Symbol, Any}
         :mean_D => isempty(env.nodes) ? 0.0 : mean(n.D for n in env.nodes),
         :nodes => [serialize_node(n) for n in env.nodes],
         :scars => [serialize_scar(s, UInt64(env.tick)) for s in env.scars],
+        :cpu_usage_per_core => zeros(Float64, Sys.CPU_THREADS),
+        :event_time_s => Dict(string(k) => Float64(v) for (k, v) in env.event_time_s),
+        :per_node_time_s =>
+            Dict(string(UInt64(id)) => Float64(v) for (id, v) in env.per_node_time_s),
+        :metric_l34_buffer_len => length(env.metric_l34_n3),
     )
 end
 
