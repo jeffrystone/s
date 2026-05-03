@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width"/>
+<title>Nodes · 3D</title>
+<style>
+  html,body { margin:0; height:100%; background:#0b0f14; overflow:hidden;
+    font-family:system-ui,sans-serif;color:#cdd6f4;}
+  #hud {
+    position:fixed;top:12px;left:12px;z-index:2;font-size:12px;line-height:1.5;
+    background:rgba(0,0,0,.42);padding:10px 12px;border-radius:8px;max-width:42ch;
+    pointer-events:none;
+  }
+  #canvas-host { width:100%; height:100%; display:block;}
+</style>
+<body>
+<div id="hud">tick=<span id="tick">–</span> · mean&nbsp;D=<span id="meanD">–</span> · узлов=<span id="nn">–</span></div>
+<div id="canvas-host"></div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+
+const host = document.getElementById("canvas-host");
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0f14);
+
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 200);
+camera.position.set(1.35, 0.9, 1.35);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(devicePixelRatio);
+host.appendChild(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.45));
+const dl = new THREE.DirectionalLight(0xffffff, 0.95);
+dl.position.set(2, 3, 1);
+scene.add(dl);
+
+const grid = new THREE.GridHelper(2.8, 12, 0x334466, 0x223348);
+scene.add(grid);
+
+const spheres = {};
+const geo = new THREE.SphereGeometry(0.065, 20, 20);
+
+function sphereColor(D) {
+  const t = Math.max(0, Math.min(1, Number(D)||0));
+  const c = new THREE.Color().setHSL(t * 0.32, 0.85, t < 0.5 ? 0.45 : 0.52);
+  return c;
+}
+
+function syncNodes(nodes) {
+  const seen = new Set();
+  for (const item of nodes) {
+    const id = String(item.id);
+    seen.add(id);
+    const sx = (item.params && item.params.start_x != null ? Number(item.params.start_x) : 2);
+    const pc = (item.params && item.params.poly_coeff != null ? Number(item.params.poly_coeff) : 1);
+    const x = sx / 1000 - 0.045;
+    const y = pc / 1000 - 0.045;
+    const z = 0.06 * Number(item.hp || 1) / 120;
+    if (!spheres[id]) {
+      const mat = new THREE.MeshStandardMaterial({ color: sphereColor(item.dissonance), metalness: 0.1, roughness: 0.55 });
+      const m = new THREE.Mesh(geo, mat);
+      scene.add(m);
+      spheres[id] = m;
+    }
+    const m = spheres[id];
+    m.material.color.copy(sphereColor(item.dissonance));
+    const s = Math.max(0.02, Math.min(0.22, 0.04 + Number(item.hp || 0) / 400));
+    m.scale.setScalar(s);
+    m.position.set(x * 4, y * 4, z);
+  }
+  for (const k of Object.keys(spheres)) {
+    if (!seen.has(k)) {
+      scene.remove(spheres[k]);
+      delete spheres[k];
+    }
+  }
+}
+
+const proto = location.protocol === "https:" ? "wss" : "ws";
+const ws = new WebSocket(`${proto}://${location.host}/`);
+ws.onerror = () => {};
+ws.onmessage = (e) => {
+  try {
+    const st = JSON.parse(e.data);
+    document.getElementById("tick").textContent = st.tick ?? "–";
+    document.getElementById("meanD").textContent = (typeof st.mean_D === "number") ? st.mean_D.toFixed(3) : "–";
+    document.getElementById("nn").textContent = st.nodes?.length ?? "–";
+    if (Array.isArray(st.nodes)) syncNodes(st.nodes);
+  } catch (_) {}
+};
+function animate() {
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+animate();
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
