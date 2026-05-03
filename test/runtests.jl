@@ -1,5 +1,7 @@
 using Test
 using Random
+using JSON3
+using StaticArrays: SA
 using Nodes
 
 @testset "greet / module load" begin
@@ -14,6 +16,43 @@ end
     @test ok1 === false && r1 isa Float64
     r5, ok5 = evaluate(t, copy(p), L5)
     @test typeof(ok5) === Bool && r5 isa Float64
+end
+
+@testset "ANALYSIS без голода очереди: d_history пополняется при перегрузе SHOT/RESONANCE" begin
+    st = Nodes.Settings(;
+        cold_start_ticks = 0,
+        analysis_interval = 2,
+        metric_weights = SA[0.19, 0.19, 0.21, 0.21, 0.20],
+        default_hp = 220.0,
+        default_mp = 72.0,
+        heavy_shot_hp_min = 900.0,
+        D_thresh_heavy = 0.12,
+        analysis_min_priority_when_due = 2400.0,
+    )
+    ta = Nodes.PollardFactoringTask(; l5_max_iter = 96)
+    rng = MersenneTwister(201)
+    env = Nodes.build_environment(ta, st; N_init = 22, shared_N = BigInt(221), rng = rng)
+    d0 = length(env.d_history)
+    for _ = 1:360
+        Nodes.step!(env, ta, st; rng = rng)
+        env.stop_reason !== :running && break
+    end
+    @test env.stop_reason === :running
+    @test length(env.d_history) - d0 >= 150
+end
+
+@testset "snapshot_json_with_broadcast_metric_deltas задаёт ключи Δws" begin
+    st = Nodes.Settings(; cold_start_ticks = 20)
+    ta = Nodes.PollardFactoringTask(; l5_max_iter = 64)
+    rng = MersenneTwister(3)
+    env = Nodes.build_environment(ta, st; N_init = 4, shared_N = BigInt(221), rng = rng)
+    prev_ev = Ref{Union{Nothing, Dict{Symbol, Float64}}}(nothing)
+    prev_nd = Ref{Union{Nothing, Dict{UInt64, Float64}}}(nothing)
+    Nodes.step!(env, ta, st; rng = rng)
+    j1 =
+        Nodes.snapshot_json_with_broadcast_metric_deltas(env, prev_ev, prev_nd)
+    d1 = JSON3.read(j1, Dict)
+    @test haskey(d1, "event_time_delta_s") && haskey(d1, "per_node_time_delta_s")
 end
 
 @testset "Environment + несколько тактов симуляции" begin
@@ -47,8 +86,30 @@ end
     @test haskey(snap, :crossover_weights)
     @test haskey(snap, :mean_D_history)
     @test snap[:mean_D_history] isa Vector{Float64}
+    @test haskey(snap, :exploration_ratio_history)
+    @test snap[:exploration_ratio_history] isa Vector{Float64}
+    @test haskey(snap, :ws_burst_steps)
+    @test snap[:ws_burst_steps] isa Int && snap[:ws_burst_steps] == 1
     j = snapshot_json(env)
     @test j isa String && occursin("\"tick\"", j)
+end
+
+@testset "recent_events_append_slice и ws_events_delta_json" begin
+    r = Vector{Dict{Symbol,Any}}([
+        Dict{Symbol,Any}(:a => 1, :tick_sim => UInt64(1)),
+        Dict{Symbol,Any}(:a => 2, :tick_sim => UInt64(2)),
+        Dict{Symbol,Any}(:a => 3, :tick_sim => UInt64(3)),
+    ])
+    @test length(recent_events_append_slice(r, 0)) == 3
+    @test length(recent_events_append_slice(r, 2)) == 1
+    @test isempty(recent_events_append_slice(r, 3))
+    @test isempty(recent_events_append_slice(r, -1))
+
+    dj = ws_events_delta_json(UInt64(5), r, 1, UInt64(9), 0.12)
+    @test occursin("\"delta\"", dj)
+    @test occursin("events_append", dj)
+    ply = ws_events_delta_payload(UInt64(1), r, 0, UInt64(2), 0.1)
+    @test ply[:delta] === true && ply[:seq] == 1 && haskey(ply, :broadcast_interval_ms)
 end
 
 @testset "L5 находит делитель для N=221" begin
@@ -212,6 +273,27 @@ end
     @test env.manual_audit[end][:action] == "reference_pair"
 end
 
+@testset "MANUAL set_tick_burst и ws_burst_steps в снапшоте" begin
+    st = Settings(; cold_start_ticks = 50, dashboard_burst_steps_max = 64)
+    ta = PollardFactoringTask(; l5_max_iter = 64)
+    rng = MersenneTwister(11)
+    env = build_environment(ta, st; N_init = 2, shared_N = BigInt(143), rng = rng)
+    put!(
+        env.manual_events,
+        Event(MANUAL; payload = Dict{Symbol,Any}(:action => :set_tick_burst, :burst_steps => 400)),
+    )
+    drain_manual!(env, ta, st; rng = rng)
+    @test env.ws_burst_steps == 64
+    put!(
+        env.manual_events,
+        Event(MANUAL; payload = Dict{Symbol,Any}(:action => :set_tick_burst, :burst => 7)),
+    )
+    drain_manual!(env, ta, st; rng = rng)
+    @test env.ws_burst_steps == 7
+    snap = state_snapshot(env)
+    @test snap[:ws_burst_steps] == 7
+end
+
 @testset "персист attention_tune, успешный force_resonance, mean_D_history" begin
     ta = PollardFactoringTask(; l5_max_iter = 256)
 
@@ -253,9 +335,15 @@ end
 
     avgD = isempty(env.nodes) ? 0.0 : sum(n.D for n in env.nodes) / length(env.nodes)
     push!(env.d_history, avgD)
+    denb = env.exploitation_budget + env.exploration_budget
+    r_expl = denb > 1e-12 ? clamp(env.exploration_budget / denb, 0.0, 1.0) : 0.5
+    push!(env.exploration_ratio_history, r_expl)
     snap = state_snapshot(env)
     @test haskey(snap, :mean_D_history)
     @test snap[:mean_D_history][end] ≈ avgD rtol = 1e-9
+    @test haskey(snap, :exploration_ratio_history)
+    @test snap[:exploration_ratio_history][end] ≈ r_expl rtol = 1e-9
+    @test length(snap[:exploration_ratio_history]) == length(snap[:mean_D_history])
 
     rm(tune_dir_sl; recursive = true)
     rm(tune_dir_rf; recursive = true)

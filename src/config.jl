@@ -44,8 +44,14 @@ Base.@kwdef mutable struct Settings
     resonance_two_stage_L1_gate::Float64 = 0.95
     analysis_priority_force_high::Bool = false
     analysis_priority_floor::Float64 = 920.0
+    """При постановке ANALYSIS по календарю `tick % interval` приоритет не ниже этого (выше любого SHOT/HEAVY в текущих клэмпах)."""
+    analysis_min_priority_when_due::Float64 = 2400.0
     appeal_extend_L2_vs_L3::Bool = false
     appeal_l2_vs_l3_min_gap::Float64 = 0.16
+    """Если true — апелляции после выстрелов L2/L3/L4 идут через единый `metric_appeal_dispatch_after_shot!`. Если false — старая ветка `if k==3/4` в `handle_shot!`."""
+    appeal_unified_dispatch::Bool = true
+    """Если true: после успешной оценки L2 при конфликте с накопленным L3 — дорогая переоценка L3."""
+    appeal_l2_challenge_l3::Bool = false
     calibration_extra_node_samples::Bool = false
     calibration_extra_nodes_per_analysis::Int = 8
     recent_events_max::Int = 96
@@ -60,4 +66,6 @@ Base.@kwdef mutable struct Settings
     manual_win_tune_eta::Float64 = 0.02
     """Если false — умножаются все три множителя `attention_tune_*`."""
     manual_win_tune_gamma_only::Bool = true
+    """Максимум шагов `step!` за один период WebSocket при `auto_step` (`ws_burst_steps`)."""
+    dashboard_burst_steps_max::Int = 128
 end

@@ -1,6 +1,6 @@
 # Руководство оператора: команды MANUAL по WebSocket
 
-Сервер: `Nodes.start_dashboard(env_ref)`, страница и тот же порт принимают WebSocket-сообщения в виде одного JSON-объекта.
+Сервер: `Nodes.start_dashboard(env_ref)`; см. **`start_dashboard(...; auto_step=true, sim=Ref(DashboardSimHandles(task, settings)))`** в разделе ниже для драйва **`step!`** из цикла WebSocket.
 
 ## Общий формат
 
@@ -12,6 +12,53 @@
 
 
 Идентификаторы узлов и шрамов передаются как число или строка; на сервере приводятся к `UInt64`.
+
+## Запуск с авто-`step!` из WebSocket
+
+По умолчанию клиент только получает снимки; **`step!`** нужно вызывать во внешнем цикле. Чтобы продвигать симуляцию **после каждого снимка в сессии** (до **`paused`** включительно блокирующая логика `step!`):
+
+```julia
+env_ref = Ref(env)
+sim = Ref(Nodes.DashboardSimHandles(task, settings))
+serverws, http_task = Nodes.start_dashboard(env_ref; auto_step = true, sim = sim)
+```
+
+Число итераций **`step!` за один период** берётся из **`env.ws_burst_steps`** (`1` при создании окружения, меняется **`set_tick_burst`**, верх **`Settings.dashboard_burst_steps_max`**).
+
+## Два текстовых кадра WebSocket (`events_delta`)
+
+По умолчанию **`send_event_delta=false`**: каждый интервал отправляется **одно** текстовое сообщение — полный JSON снимка `state_snapshot` (совместимо с произвольными потребителями).
+
+При **`send_event_delta=true`** в **`start_dashboard`**, за один интервал отправляются **подряд два** сообщения:
+
+1. Полный JSON снимок (как выше).
+2. Объект с полем **`delta: true`**: **`seq`** (монотонный счётчик кадров сессии), **`tick`** (значение `env.tick` **после** локального burst `step!` этого интервала), **`t_server_ms`**, **`broadcast_interval_ms`** (оценка `interval · 1000` мс), **`events_append`** — записи журнала `recent_events`, добавленные **после** момента сериализации первого сообщения до конца burst `step!` на этом интервале.
+
+Страница **`web/index.html`** объединяет дельту с хвостом из полного снимка в кольцевой буфер и рисует лучи с учётом `performance.now()`.
+
+Пример запуска с дельтой:
+
+```julia
+Nodes.start_dashboard(env_ref; auto_step=true, sim=sim, send_event_delta=true)
+```
+
+### `broadcast_metric_deltas`
+
+При **`broadcast_metric_deltas=true`** первый текстовый кадр (полный JSON) проходит через **`snapshot_json_with_broadcast_metric_deltas`**, в объект добавляются:
+
+- **`event_time_delta_s`**: секунды wall-time по типам событий **с прошлой рассылки** кадра сессии (разница кумулятивных `env.event_time_s`),
+- **`per_node_time_delta_s`**: то же по узлам (`env.per_node_time_s`, ключи — строковые id).
+
+Семантика **`event_time_s`** / **`per_node_time_s`** в корне снимка не меняется (кумулятив за сессию). На **первом** кадре WebSocket-сессии значения Δ совпадают с накопленным с начала симулятора (предыдущий буфер `nothing`).
+
+```julia
+Nodes.start_dashboard(env_ref;
+    auto_step = true,
+    sim = sim,
+    broadcast_metric_deltas = true)
+```
+
+Клиент **`web/dashboard_app.js`**: столбики HUD предпочитают **`event_time_delta_s`**, если там есть положительные значения; столбики по узлам над сценой строятся по **`per_node_time_s`** (топ-K).
 
 ## Действия
 
@@ -25,7 +72,7 @@
 
 ### `delete_node`
 
-Удалить узел по `node_id`; в область добавляется **шрам** с умеренным потенциалом (антидубль по параметрам задачи через `failure_scar_meta`).
+Удалить узел по `node_id` из популяции (фильтрация вектора `env.nodes`). Запись шрама при удалении **не выполняется** автоматически в текущей реализации движка.
 
 ```json
 {"action":"delete_node","node_id":"3"}
@@ -72,6 +119,17 @@
 {"action":"resume"}
 ```
 
+### `set_tick_burst`
+
+Сколько раз за один интервал отправки WebSocket выполняется **`step!`**, когда включён **`auto_step`** у `start_dashboard` (до клампа **`0..dashboard_burst_steps_max`**). Удобно менять ползунком «шагов за кадр» в `web/index.html`.
+
+Эквивалентные поля **`burst_steps`** или короткий **`burst`**:
+
+```json
+{"action":"set_tick_burst","burst_steps":8}
+{"action":"set_tick_burst","burst":8}
+```
+
 ### `reference_pair`
 
 Подкручивает множители **`attention_tune_alpha`** / **`attention_tune_beta`** / **`attention_tune_gamma`** по отношению к значениям по умолчанию в активной **`Environment`** (поля задаются в коде задачи через `attention_*`; повтор команды суммирует эффект в пределах `clamp`). Опциональные ключи **`boost_alpha`**, **`boost_beta`**, **`boost_gamma`** задают множитель к текущей тройке («эталонная пара» задаёт операторское направление).
@@ -98,10 +156,20 @@
 
 ## Снапшот
 
-Дополнительно в JSON транслируются **`mean_D_history`** (копия буфера среднего `D` после проходов ANALYSIS; клиент использует для sparkline), `metric_l34_buffer_len`, `recent_events`, `manual_audit_tail`, `leader_node`, `paused`, `t_wall_ms`, множители внимания, в шрамах — поле `id` для связки с `clear_scar`.
+Дополнительно в JSON транслируются **`mean_D_history`** (копия буфера среднего `D` после проходов ANALYSIS) и **`exploration_ratio_history`** (на тех же отсечках ANALYSIS — доля `exploration_budget` в сумме бюджетов после правок застоя/прогресса в `analysis_pass!`; на клиенте вторая кривая на том же канвасе, что средний `D`), **`ws_burst_steps`**, **`metric_l34_buffer_len`**, **`recent_events`**, **`manual_audit_tail`**, **`leader_node`**, **`paused`**, **`t_wall_ms`**, множители внимания, **`event_time_s`** / **`per_node_time_s`** (кумулятив wall-time симулятора), в шрамах — поле `id` для связки с `clear_scar`; при **`broadcast_metric_deltas=true`** — см. там же ключи **`event_time_delta_s`** и **`per_node_time_delta_s`**.
+
+Дополнительные события между полными JSON и второй кадр WebSocket см. раздел «Два текстовых кадра WebSocket» при **`send_event_delta=true`**.
+
+В `web/index.html` чекбоксы слоёв сцены (шрамы, лучи событий, спящие узлы) запоминают состояние в **`localStorage`** (`nodes_layer_*`); выбранное число **`burst_steps`** можно хранить в **`nodes_burst_steps`**. ПКМ по узлу или шраму на canvas открывает контекстное меню (primary/secondary id, удаление, новый узел через модалку Pollard, принудительный резонанс при двух разных id в полях). **Esc** закрывает меню и модалку.
+
+### Приоритет ANALYSIS на календарном такте
+
+Для тактов с `tick % analysis_interval == 0` приоритет события **ANALYSIS** не ниже **`Settings.analysis_min_priority_when_due`** (по умолчанию выше максимума клэмпа SHOT в планировщике), чтобы проход **`analysis_pass!`** не подвисал под потоком SHOT/HEAVY/RESONANCE.
 
 В хвосте **`manual_audit_tail`** для действия **`force_resonance`** в последней записи может быть поле **`child_improved`** (`true`/`false`).
 
 ## Другие поля симулятора
 
 Размер буфера калибровки L3/L4 настраивается в `Settings` (`analysis_calibration_*`). Калибровка запускается на проходе ANALYSIS при достаточном числе наблюдений пар нормализованных показателей после выстрелов L4.
+
+Апелляции метрик после выстрелов: при **`appeal_unified_dispatch=true`** (умолчанию) после SHOT используется единый диспетчер **`metric_appeal_dispatch_after_shot!`**; при **`appeal_unified_dispatch=false`** сохраняется прежняя ветвь в `handle_shot!`. Опциональная переоценка L3 после L2 при включённом **`appeal_l2_challenge_l3`** задействует те же пороги, что и расширенная связка L2–L4 (`appeal_extend_L2_vs_L3`, `appeal_l2_vs_l3_min_gap`).

@@ -92,6 +92,8 @@ mutable struct Environment
     next_id::UInt64
     schedule_seq::UInt64
     d_history::Vector{Float64}
+    """Доля exploration на каждом ANALYSIS после правок бюджета (размер окна как у `d_history`)."""
+    exploration_ratio_history::Vector{Float64}
     stuck_counter::Int
     stop_reason::Symbol
     event_time_s::Dict{Symbol, Float64}
@@ -110,6 +112,8 @@ mutable struct Environment
     attention_tune_alpha::Float64
     attention_tune_beta::Float64
     attention_tune_gamma::Float64
+    """Сколько раз вызывать `step!` за период бродкаста при `start_dashboard(...; auto_step=true)`."""
+    ws_burst_steps::Int
     """Пауза симуляции (MANUAL / UI)."""
     paused::Bool
 end

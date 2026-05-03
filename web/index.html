@@ -21,6 +21,13 @@
   }
   #dspark { display:block; margin-top:4px; border-radius:4px; background:rgba(0,0,0,.28);
     image-rendering:pixelated; pointer-events:none;}
+  #ops .layers-inline {
+    display:flex; flex-wrap:wrap; gap:8px 12px; margin-top:8px; align-items:center;
+    border-top:1px solid rgba(100,140,190,.35); padding-top:8px;}
+  #ops .layers-inline label {
+    display:inline-flex; align-items:center; gap:5px; margin:0; cursor:pointer;
+    font-size:11px; opacity:.92; width:auto;}
+  #ops .layers-inline input[type=checkbox] { width:auto; margin:0; cursor:pointer; accent-color:#6ab;}
   #tooltip {
     position:fixed;z-index:10;pointer-events:none;display:none;
     background:rgba(8,14,28,.92);border:1px solid #367;padding:8px 10px;
@@ -36,7 +43,35 @@
     font-family:ui-monospace,monospace;font-size:11px;background:#102030;color:#def;border:1px solid #346;padding:4px 6px;border-radius:4px;}
   #ops .btns button { margin-top:6px;margin-right:6px;padding:5px 9px;cursor:pointer;border-radius:4px;border:1px solid #468;background:#1a3a55;color:#cef;font-size:11px;}
   #ops .btns button.ghost { background:#223044;border-color:#456;}
-  #canvas-host { width:100%; height:100%; display:block;}
+  #addNodeBackdrop {
+    display:none; position:fixed; inset:0; z-index:40; background:rgba(0,0,0,.55);
+    align-items:center; justify-content:center; pointer-events:auto;
+  }
+  #addNodePanel {
+    width:min(34ch,calc(100vw - 32px)); background:rgba(12,28,52,.96); border:1px solid #478;
+    border-radius:10px; padding:14px 16px 16px; color:#cde; box-shadow:0 8px 32px rgba(0,0,0,.5);
+    font-size:11px; line-height:1.45;
+  }
+  #addNodePanel h3 { margin:0 0 10px 0; font-size:13px; font-weight:600; color:#9df;}
+  #addNodePanel label { display:block; margin-top:8px; opacity:.88;}
+  #addNodePanel input { width:100%; box-sizing:border-box; margin-top:3px; padding:6px 7px;
+    border-radius:4px; border:1px solid #357; background:#0e2038; color:#def; font-family:ui-monospace,monospace;}
+  #addNodePanel .row-btns { margin-top:12px; display:flex; gap:8px; justify-content:flex-end;}
+  #addNodePanel button { cursor:pointer; padding:6px 12px; border-radius:6px; border:1px solid #468;
+    background:#1a3f62; color:#cef; font-size:11px;}
+  #ctxMenu {
+    display:none; position:fixed; z-index:35; background:rgba(8,22,42,.94);
+    border:1px solid #468; border-radius:8px; min-width:200px;
+    padding:5px 0; font-size:11px; color:#bde; pointer-events:auto;
+    box-shadow:0 6px 24px rgba(0,0,0,.5);
+  }
+  #ctxMenu button {
+    display:block; width:100%; text-align:left; padding:7px 12px;
+    background:transparent; border:none; color:inherit; cursor:pointer;
+    font-size:11px; font-family:inherit;
+  }
+  #ctxMenu button:hover { background:rgba(70,140,210,.28);}
+  #ctxMenu hr { border:none; border-top:1px solid rgba(100,140,190,.35); margin:5px 0;}
 </style>
 <body>
 <div id="hud">
@@ -45,15 +80,49 @@
   <div class="row">узлов <span id="nn">–</span> · L34&nbsp;buf=<span id="l34n">–</span>
     · attn αβγ=<span id="attn">–</span></div>
   <div class="row dim">budgets exp=<span id="bexp">–</span> exploit=<span id="bexo">–</span></div>
+  <div class="row dim">burst <span id="burstHud">–</span> · выбор узла: <b>Ctrl+ЛКМ</b> → поле id, <b>Ctrl+Shift+ЛКМ</b> → второй узел</div>
   <div class="row dim" id="leadLine">лидер —</div>
   <div id="cpu-strip" aria-hidden="true"></div>
-  <div class="row dim" style="margin-top:6px;">mean&nbsp;D (окно анализа)</div>
-  <canvas id="dspark" width="200" height="40" title="История среднего D"></canvas>
+  <div class="row dim" style="margin-top:6px;">анализ: зел.&nbsp;<span style="color:#6fd4a0">●</span> mean&nbsp;D
+    · оранж.&nbsp;<span style="color:#e8a050">●</span> доля&nbsp;explore</div>
+  <canvas id="dspark" width="220" height="52" title="История среднего D и доли exploration (последние ANALYSIS)"></canvas>
+  <div class="row dim" id="evtTimeCaption">время типов событий (кумул. с сек.)</div>
+  <canvas id="evtBarsHud" width="216" height="72" title="Секунды wall-time по типам событий"></canvas>
 </div>
 <div id="tooltip"></div>
+<div id="ctxMenu" aria-hidden="true"></div>
+<div id="addNodeBackdrop">
+  <div id="addNodePanel" role="dialog" aria-labelledby="addNodeTitle">
+    <h3 id="addNodeTitle">Новый узел Pollard</h3>
+    <label>N <input id="anN" type="text" value="221"/></label>
+    <label>start_x <input id="anSx" type="number" step="any" value="7"/></label>
+    <label>poly_coeff <input id="anPc" type="number" step="any" value="23"/></label>
+    <div class="row-btns">
+      <button type="button" id="anCancel" class="ghost">Отмена</button>
+      <button type="button" id="anOk">Создать</button>
+    </div>
+  </div>
+</div>
 <div id="canvas-host"></div>
 <div id="ops">
-  <strong>MANUAL</strong>
+  <div class="layers-inline" id="sceneLayers">
+    <label><input type="checkbox" id="layScars" checked /> шрамы</label>
+    <label><input type="checkbox" id="layBeams" checked /> лучи событий</label>
+    <label><input type="checkbox" id="layDorm" checked /> спящие узлы</label>
+  </div>
+  <label>шагов <code>step!</code> за кадр WS <span class="dim">(set_tick_burst)</span></label>
+  <select id="burstSel" style="width:100%;margin-top:4px;font-size:11px;padding:4px 6px;border-radius:4px;background:#102030;color:#def;border:1px solid #346;">
+    <option value="0">0 (только снимок)</option>
+    <option value="1" selected>1</option>
+    <option value="2">2</option>
+    <option value="4">4</option>
+    <option value="8">8</option>
+    <option value="16">16</option>
+    <option value="32">32</option>
+    <option value="64">64</option>
+    <option value="128">128</option>
+  </select>
+  <strong style="margin-top:6px;display:inline-block;">MANUAL</strong>
   <div class="btns">
     <button type="button" id="btnPause">Пауза</button>
     <button type="button" id="btnResume" class="ghost">Продолжить</button>
@@ -68,7 +137,7 @@
     <button type="button" id="btnDel" class="ghost">delete_node</button>
     <button type="button" id="btnFrz" class="ghost">set_mp_frozen</button>
   </div>
-  <div style="margin-top:8px;opacity:.75;font-size:10px">Камера: вращение ЛКМ, пан СКМ / Shift+ЛКМ, зум колёсиком.
+  <div style="margin-top:8px;opacity:.75;font-size:10px">Камера: вращение ЛКМ, пан СКМ / Shift+ЛКМ, зум колёсиком. Авто-<code>step!</code>: <code>start_dashboard(...; auto_step=true, sim=Ref(DashboardSimHandles(task, st)))</code>. Две рассылки WS (полный JSON + дельта событий): <code>send_event_delta=true</code> — см. <code>docs/OPERATOR.md</code>.
   <code>force_resonance</code>: <code>{"action":"force_resonance","node_a":"1","node_b":"2"}</code></div>
 </div>
 <script type="importmap">
@@ -78,378 +147,6 @@
   }
 }
 </script>
-<script type="module">
-import * as THREE from "three";
-import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js";
-
-const host = document.getElementById("canvas-host");
-const tooltip = document.getElementById("tooltip");
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0b0f14);
-
-const camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.08, 240);
-camera.position.set(2.4, 1.6, 2.35);
-
-const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setSize(innerWidth, innerHeight);
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-host.appendChild(renderer.domElement);
-
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.dampingFactor = 0.06;
-controls.target.set(0, 0.12, 0);
-
-scene.add(new THREE.AmbientLight(0xffffff, 0.42));
-const dl = new THREE.DirectionalLight(0xffffff, 0.88);
-dl.position.set(2.8, 4.2, 1.8);
-scene.add(dl);
-
-const grid = new THREE.GridHelper(4.8, 16, 0x334466, 0x1c2840);
-scene.add(grid);
-
-const spheres = {};
-const scars = {};
-const geo = new THREE.SphereGeometry(0.068, 22, 22);
-const scarBaseGeo = new THREE.SphereGeometry(0.62, 20, 20);
-
-const spheresGroup = new THREE.Group();
-const scarsGroup = new THREE.Group();
-const eventsGroup = new THREE.Group();
-scene.add(spheresGroup);
-scene.add(scarsGroup);
-scene.add(eventsGroup);
-
-const raycaster = new THREE.Raycaster();
-const pointer = new THREE.Vector2();
-
-function sphereColor(D) {
-  const t = Math.max(0, Math.min(1, Number(D) || 0));
-  return new THREE.Color().setHSL(t * 0.32, 0.85, t < 0.5 ? 0.42 : 0.5);
-}
-
-function pollardXYZ(params, hp) {
-  const p = params || {};
-  const sx = (p.start_x != null ? Number(p.start_x) : (p.startx != null ? Number(p.startx) : 2));
-  const pc = (p.poly_coeff != null ? Number(p.poly_coeff) : 1);
-  const h = hp != null && hp > 0 ? Number(hp) : 1;
-  const x = (sx / 1000 - 0.045) * 4;
-  const y = (pc / 1000 - 0.045) * 4;
-  const z = 0.06 * Math.max(0.01, h) / 120;
-  return new THREE.Vector3(x, y, z);
-}
-
-function scarFailHue(flv) {
-  const fl = Number(flv) || 1;
-  if (fl >= 5) return 0.97;
-  if (fl >= 4) return 0.93;
-  if (fl >= 3) return 0.08;
-  return 0.88;
-}
-
-function syncNodes(nodes) {
-  const seen = new Set();
-  for (const item of nodes || []) {
-    const id = String(item.id);
-    seen.add(id);
-    const pos = pollardXYZ(item.params, item.hp);
-    if (!spheres[id]) {
-      const mat = new THREE.MeshStandardMaterial({
-        color: 0x88ccaa,
-        metalness: 0.12,
-        roughness: 0.52,
-        transparent: true,
-      });
-      const m = new THREE.Mesh(geo, mat);
-      m.castShadow = false;
-      m.userData.kind = "node";
-      spheresGroup.add(m);
-      spheres[id] = m;
-    }
-    const m = spheres[id];
-    m.position.copy(pos);
-    m.material.color.copy(sphereColor(item.dissonance));
-
-    const hp = Number(item.hp || 0);
-    const mp = Number(item.mp || 0);
-    const frozen = !!item.mp_frozen;
-    const asleep = hp <= 1e-6 && mp > 0;
-
-    m.material.transparent = asleep;
-    m.material.opacity = asleep ? 0.38 : 1;
-    const mpNorm = Math.max(0, Math.min(1, mp / 90));
-    if (frozen) {
-      m.material.emissive.setHex(0x224466);
-      m.material.emissiveIntensity = 0.35 + mpNorm * 0.25;
-      m.material.metalness = 0.35;
-      m.material.roughness = 0.38;
-    } else {
-      m.material.emissive.setHSL(0.52, 0.45, 0.12 + mpNorm * 0.38);
-      m.material.emissiveIntensity = 0.15 + mpNorm * 0.55;
-      m.material.metalness = 0.1;
-      m.material.roughness = 0.52 + (asleep ? 0.08 : 0);
-    }
-
-    const s = Math.max(0.026, Math.min(0.24, 0.042 + hp / 360));
-    m.scale.setScalar(s);
-    m.userData.nodeSnap = item;
-  }
-  for (const k of Object.keys(spheres)) {
-    if (!seen.has(k)) {
-      spheresGroup.remove(spheres[k]);
-      delete spheres[k];
-    }
-  }
-}
-
-function syncScars(list, paused) {
-  const seen = new Set();
-  for (const sc of list || []) {
-    const id = String(sc.id ?? sc.scar_id ?? "");
-    if (!id) continue;
-    seen.add(id);
-    const c = sc.center || {};
-    const pv = pollardXYZ(c, 60);
-    const pot = typeof sc.potential === "number" ? sc.potential : 0.35;
-    const rad = typeof sc.radius === "number" ? sc.radius : 0.06;
-    if (!scars[id]) {
-      const mat = new THREE.MeshPhysicalMaterial({
-        color: new THREE.Color().setHSL(scarFailHue(sc.fail_level), 0.82, 0.48),
-        metalness: 0.06,
-        roughness: 0.42,
-        transparent: true,
-        transmission: 0.35,
-        thickness: 0.4,
-        clearcoat: 0.08,
-      });
-      const mesh = new THREE.Mesh(scarBaseGeo, mat);
-      mesh.userData.kind = "scar";
-      scarsGroup.add(mesh);
-      scars[id] = mesh;
-    }
-    const mesh = scars[id];
-    mesh.position.set(pv.x, pv.y * 0.98, pv.z * 0.4 + Math.sqrt(Math.max(pot, 0.05)) * 0.06);
-    const scale = Math.max(0.05, Math.min(0.9, rad * (paused ? 2.8 : 3.8)));
-    mesh.scale.setScalar(scale);
-    mesh.material.opacity = Math.max(0.12, Math.min(0.82, pot * 0.85));
-    mesh.material.color.setHSL(scarFailHue(sc.fail_level), 0.75, 0.42 + 0.06 * Math.min(sc.fail_level || 1, 5));
-    mesh.visible = pot > 0.02;
-  }
-  for (const k of Object.keys(scars)) {
-    if (!seen.has(k)) {
-      scarsGroup.remove(scars[k]);
-      delete scars[k];
-    }
-  }
-}
-
-const shotLvlColor = ["0x8899aa","0xaabbdd","0xccaaff","0xbb66ff"];
-
-function meshForNode(idStr) {
-  return spheres[String(idStr)] || null;
-}
-
-function segmentLine(a, b, hex, opacity) {
-  const geom = new THREE.BufferGeometry().setFromPoints([a.clone(), b.clone()]);
-  const mat = new THREE.LineBasicMaterial({
-    color: parseInt(hex, 16),
-    transparent: true,
-    opacity,
-    linewidth: 1,
-  });
-  const line = new THREE.Line(geom, mat);
-  eventsGroup.add(line);
-  return line;
-}
-
-function drawRecentEvents(arr) {
-  while (eventsGroup.children.length)
-    eventsGroup.remove(eventsGroup.children[0]);
-  if (!Array.isArray(arr) || arr.length === 0) return;
-  let i = 0;
-  for (const ev of arr) {
-    i += 1;
-    const frac = Math.max(0.15, Math.min(1, (i / arr.length) * 1.05));
-    const typ = String(ev.type ?? "");
-    const n1 = meshForNode(ev.node_id);
-    if (typ.includes("SHOT") && !typ.includes("HEAVY")) {
-      const p0 = (n1 && n1.position.clone()) || new THREE.Vector3(0, 0.1, 0);
-      const k = Number(ev.shot_level ?? 1) - 1;
-      const hx = shotLvlColor[Math.max(0, Math.min(shotLvlColor.length - 1, k))];
-      const off = new THREE.Vector3(0.18 + k * 0.04, 0.26, 0.12);
-      segmentLine(p0, p0.clone().add(off), hx, 0.22 + 0.35 * frac);
-    } else if (typ.includes("HEAVY")) {
-      const p0 = (n1 && n1.position.clone()) || new THREE.Vector3();
-      segmentLine(p0, p0.clone().add(new THREE.Vector3(-0.2, 0.55, 0.08)), "0xff6644", 0.42 + 0.25 * frac);
-    } else if (typ.includes("RESONANCE")) {
-      const a = meshForNode(ev.node_id);
-      const b = meshForNode(ev.partner_id);
-      if (a && b)
-        segmentLine(a.position.clone(), b.position.clone(), "0xffcc66", 0.28 + 0.38 * frac);
-    } else if (typ.includes("ANALYSIS")) {
-      segmentLine(new THREE.Vector3(-0.3, 0.15, -0.2), new THREE.Vector3(0.25, 0.12, -0.15), "0x5588aa", 0.08 + 0.12 * frac);
-    }
-  }
-}
-
-function cpuBarHtml(vals) {
-  const el = document.getElementById("cpu-strip");
-  el.innerHTML = "";
-  if (!Array.isArray(vals)) return;
-  for (const v of vals) {
-    const t = Math.max(0, Math.min(1, Number(v) || 0));
-    const sp = document.createElement("span");
-    const hue = 120 - Math.round(t * 120);
-    sp.style.background = `hsl(${hue} 82% ${34 + Math.round(t * 28)}%)`;
-    sp.title = `core ~${Math.round(t * 100)}%`;
-    el.appendChild(sp);
-  }
-}
-
-function fmtLeader(lead) {
-  if (!lead || lead.params == null) return "—";
-  try {
-    const p = lead.params;
-    const N = (p.N != null ? String(p.N) : "?");
-    return `id ${lead.id} · D=${(Number(lead.dissonance)||0).toFixed(3)} · N=${N}`;
-  } catch (_) { return "—"; }
-}
-
-function drawMeanDSparkline(vals) {
-  const cvs = document.getElementById("dspark");
-  if (!cvs) return;
-  const ctx = cvs.getContext("2d");
-  const w = cvs.width;
-  const h = cvs.height;
-  ctx.clearRect(0, 0, w, h);
-  ctx.strokeStyle = "rgba(80,130,200,.4)";
-  ctx.lineWidth = 1;
-  ctx.strokeRect(0.5, 0.5, w - 1, h - 1);
-  if (!Array.isArray(vals) || vals.length < 2) return;
-  const ys = vals.map((v) => Number(v));
-  let lo = Infinity;
-  let hi = -Infinity;
-  for (let i = 0; i < ys.length; i++) {
-    const v = ys[i];
-    if (!Number.isFinite(v)) continue;
-    lo = Math.min(lo, v);
-    hi = Math.max(hi, v);
-  }
-  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return;
-  if (hi === lo) hi = lo + 1e-6;
-  const pad = 5;
-  ctx.strokeStyle = "#6fd4a0";
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  for (let i = 0; i < ys.length; i++) {
-    const t = ys.length <= 1 ? 0.5 : i / (ys.length - 1);
-    const x = pad + t * (w - 2 * pad);
-    const y = pad + (1 - (ys[i] - lo) / (hi - lo)) * (h - 2 * pad);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
-}
-
-const proto = location.protocol === "https:" ? "wss" : "ws";
-const ws = new WebSocket(`${proto}://${location.host}/`);
-function sendJson(obj) {
-  if (ws.readyState !== WebSocket.OPEN) return;
-  ws.send(typeof obj === "string" ? obj : JSON.stringify(obj));
-}
-document.getElementById("btnSend").onclick = () => {
-  const raw = document.getElementById("jcmd").value.trim();
-  if (!raw) return;
-  try { sendJson(JSON.parse(raw)); } catch (e) { alert("JSON: " + e); }
-};
-document.getElementById("btnDel").onclick = () => {
-  const id = document.getElementById("mid").value.trim() || "1";
-  sendJson({ action: "delete_node", node_id: id });
-};
-document.getElementById("btnFrz").onclick = () => {
-  const id = document.getElementById("mid").value.trim() || "1";
-  sendJson({ action: "set_mp_frozen", node_id: id, frozen: true });
-};
-document.getElementById("btnPause").onclick = () => sendJson({ action: "pause" });
-document.getElementById("btnResume").onclick = () => sendJson({ action: "resume" });
-document.getElementById("btnRefPair").onclick = () => {
-  const a = document.getElementById("mid").value.trim() || "1";
-  const b = document.getElementById("mid2").value.trim() || "2";
-  sendJson({ action: "reference_pair", node_a: a, node_b: b });
-};
-ws.onerror = () => {};
-ws.onmessage = (e) => {
-  try {
-    const st = JSON.parse(e.data);
-    const paused = !!st.paused;
-    document.getElementById("pauseTag").textContent = paused ? "ПАУЗА · " : "";
-    document.getElementById("pauseTag").className = paused ? "warn" : "";
-    document.getElementById("tick").textContent = st.tick ?? "–";
-    document.getElementById("meanD").textContent =
-      (typeof st.mean_D === "number") ? st.mean_D.toFixed(3) : "–";
-    document.getElementById("wall").textContent =
-      typeof st.t_wall_ms === "number" ? `${st.t_wall_ms} ms` : "–";
-    document.getElementById("nn").textContent = st.nodes?.length ?? "–";
-    document.getElementById("l34n").textContent =
-      (typeof st.metric_l34_buffer_len === "number") ? String(st.metric_l34_buffer_len) : "–";
-    const ta = Number(st.attention_tune_alpha ?? 1);
-    const tb = Number(st.attention_tune_beta ?? 1);
-    const tg = Number(st.attention_tune_gamma ?? 1);
-    document.getElementById("attn").textContent =
-      `${ta.toFixed(2)}/${tb.toFixed(2)}/${tg.toFixed(2)}`;
-    document.getElementById("bexp").textContent =
-      (typeof st.exploration_budget === "number") ? st.exploration_budget.toFixed(1) : "–";
-    document.getElementById("bexo").textContent =
-      (typeof st.exploitation_budget === "number") ? st.exploitation_budget.toFixed(1) : "–";
-    document.getElementById("leadLine").textContent =
-      `лидер: ${fmtLeader(st.leader_node)}`;
-    cpuBarHtml(st.cpu_usage_per_core);
-    drawMeanDSparkline(st.mean_D_history);
-    if (Array.isArray(st.nodes)) {
-      syncNodes(st.nodes);
-      syncScars(st.scars, paused);
-      drawRecentEvents(st.recent_events);
-    }
-  } catch (_) {}
-};
-
-function animate() {
-  requestAnimationFrame(animate);
-  controls.update();
-  renderer.render(scene, camera);
-}
-animate();
-
-addEventListener("resize", () => {
-  camera.aspect = innerWidth / innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth, innerHeight);
-});
-
-function onPointerMove(ev) {
-  const rect = renderer.domElement.getBoundingClientRect();
-  pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
-  pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
-  const objs = [...Object.values(spheres)];
-  const hit = objs.length ? raycaster.intersectObjects(objs, false)[0] : null;
-  if (hit && hit.object.userData.nodeSnap) {
-    const n = hit.object.userData.nodeSnap;
-    tooltip.style.display = "block";
-    tooltip.style.left = `${ev.clientX + 14}px`;
-    tooltip.style.top = `${ev.clientY + 14}px`;
-    const fz = n.mp_frozen ? "frozen" : "act";
-    const params = typeof n.params === "object" && n.params ? JSON.stringify(n.params).slice(0, 420) : "";
-    tooltip.innerHTML =
-      `<b>#${n.id}</b> ${fz}<br/>D ${(Number(n.dissonance)||0).toFixed(4)}
-      · hp ${(Number(n.hp)||0).toFixed(2)} · mp ${(Number(n.mp)||0).toFixed(2)}` +
-      (params ? `<br/><span class="dim">${params}</span>` : "");
-    renderer.domElement.style.cursor = "crosshair";
-  } else {
-    tooltip.style.display = "none";
-    renderer.domElement.style.cursor = "";
-  }
-}
-renderer.domElement.addEventListener("mousemove", onPointerMove);
-renderer.domElement.addEventListener("mouseleave", () => { tooltip.style.display = "none"; });
-</script>
+<script type="module" src="/dashboard_app.js"></script>
+</body>
+</html>
