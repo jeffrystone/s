@@ -149,7 +149,7 @@ function strong_scar_near(task::AbstractTask, env::Environment, node::Node, st::
         return false
     end
 
-    if length(filt) < st.scar_kdtree_min
+    if length(filt) < st.strong_scar_kdtree_min
         return brute_near()
     end
 

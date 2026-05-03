@@ -9,6 +9,7 @@ function analysis_pass!(
     tn = UInt64(env.tick)
 
     maybe_calibration_l34_weights!(env, st)
+    maybe_push_population_l34_pairs!(env, st; rng = rng)
 
     if st.calibration_extra_node_samples && !isempty(env.nodes)
         picks::Vector{Int} = shuffle(rng, collect(eachindex(env.nodes)))
@@ -126,6 +127,7 @@ function rebuild_schedule!(env::Environment, task::AbstractTask, st::Settings; r
             touched(aid) && continue
             na = fetch_node(env.nodes, aid)
             na === nothing && continue
+            na.hp < st.resonance_initiator_hp_floor && continue
             cand = res_candidates(env, aid)
             isempty(cand) && continue
 
@@ -152,7 +154,7 @@ function rebuild_schedule!(env::Environment, task::AbstractTask, st::Settings; r
 
     # M1 ANALYSIS-slot: литеральный маленький quantum проигрывал SHOT (~1900) и голодал очередь.
     ai = UInt64(max(1, st.analysis_interval))
-    if tn % ai == UInt64(0)
+    if tn % ai == UInt64(0) && !st.analysis_calendar_exclusive_slot
         pr_an = Float64(
             if st.analysis_priority_force_high
                 max(Float64(st.analysis_priority_floor), Float64(st.analysis_priority_quantum) * 1_000)

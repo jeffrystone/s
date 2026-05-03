@@ -43,7 +43,8 @@ export Node,
        drain_manual!,
        save_attention_tune,
        load_attention_tune!,
-       maybe_save_attention_tune!
+       maybe_save_attention_tune!,
+       validate_environment!
 
 include("types.jl")
 include("config.jl")

@@ -1,3 +1,5 @@
+using Random
+
 """Сборка среды, один такт симуляции, цикл simulate."""
 
 function _init_crossover_weights(task::AbstractTask)::Dict{Symbol, Float64}
@@ -16,10 +18,20 @@ function build_environment(
     shared_N::BigInt = big(221),
     rng::AbstractRNG = default_rng(),
 )::Environment
+    rng_use::AbstractRNG =
+        st.use_simulation_rng_seed && st.simulation_rng_seed !== nothing ?
+        Random.Xoshiro(UInt64(st.simulation_rng_seed::UInt64)) : rng
     nodes = Node[]
     next_id = UInt64(1)
+    frac = st.pollard_extreme_seed_fraction
     for _ = 1:Int(N_init)
-        p = generate_random_params(task, Scar[]; rng = rng, shared_N = shared_N)
+        p = generate_random_params(
+            task,
+            Scar[];
+            rng = rng_use,
+            shared_N = shared_N,
+            extreme_seed_fraction = frac,
+        )
         n = Node(next_id, p; hp = st.default_hp, mp = st.default_mp, D = 0.5)
         warm_start!(task, n, st)
         push!(nodes, n)
@@ -96,6 +108,13 @@ function step!(
     env.stop_reason !== :running && return
 
     rebuild_schedule!(env, task, st; rng = rng)
+    ai = UInt64(max(1, st.analysis_interval))
+    calendar_slot = UInt64(env.tick) % ai == UInt64(0)
+    if st.analysis_calendar_exclusive_slot && calendar_slot
+        handle_analysis_evt!(env, task, st, Event(ANALYSIS); rng = rng)
+        env.tick += UInt64(1)
+        return
+    end
     if isempty(env.event_queue)
         env.tick += UInt64(1)
         return

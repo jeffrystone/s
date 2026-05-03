@@ -137,14 +137,24 @@ function failure_scar_meta(::PollardFactoringTask, params::Dict{Symbol, Any})
     (c, 0.06, 5, 0.00025)
 end
 
-function generate_random_params(task::PollardFactoringTask, scars::Vector{Scar}; rng::AbstractRNG = Random.default_rng(), shared_N::BigInt)::Dict{Symbol, Any}
+function generate_random_params(
+    task::PollardFactoringTask,
+    scars::Vector{Scar};
+    rng::AbstractRNG = Random.default_rng(),
+    shared_N::BigInt,
+    extreme_seed_fraction::Float64 = 0.0,
+)::Dict{Symbol, Any}
     local p::Dict{Symbol, Any}
     for _ = 1:800
-        p = Dict{Symbol,Any}(
-            :N => shared_N,
-            :start_x => rand(rng, 2:99_999),
-            :poly_coeff => rand(rng, 1:999),
-        )
+        sx, pc =
+            if extreme_seed_fraction > 0 && rand(rng) < extreme_seed_fraction
+                sx0 = rand(rng) < 0.5 ? rand(rng, 2:128) : rand(rng, 99_500:99_999)
+                pc0 = rand(rng) < 0.5 ? rand(rng, 1:40) : rand(rng, 920:999)
+                sx0, pc0
+            else
+                rand(rng, 2:99_999), rand(rng, 1:999)
+            end
+        p = Dict{Symbol,Any}(:N => shared_N, :start_x => sx, :poly_coeff => pc)
         params_forbidden_by_scars(task, p, scars) || break
     end
     p

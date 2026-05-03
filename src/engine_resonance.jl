@@ -39,21 +39,54 @@ function perform_resonance_between!(
     best_op::Symbol = ops[1]
 
     Nt = offspring_n(max(na.hp, 1.0), max(nb.mp, 1.0))
+    mwv::Vector{Float64} = Vector{Float64}(env.metric_weights)
 
-    for _ = 1:Nt
-        op = wsample(rng, ops, wt)
-        ch = crossover(task, na.params, nb.params, op; rng = rng)
-        sc = offspring_metric_score!(
-            task,
-            ch,
-            Vector{Float64}(env.metric_weights),
-            env,
-            st,
-        )
-        if sc < best_s
-            best_s = sc
-            best_p = ch
-            best_op = op
+    use_parallel =
+        st.parallel_offspring &&
+            Nt >= st.parallel_offspring_min_trials &&
+            !(st.parallel_offspring_disable_with_eval_cache && st.evaluate_cache_enabled)
+
+    if use_parallel
+        base_u = rand(rng, UInt64)
+        scores_th = Vector{Float64}(undef, Nt)
+        ch_th = Vector{Dict{Symbol, Any}}(undef, Nt)
+        op_th = Vector{Symbol}(undef, Nt)
+        Base.Threads.@threads for ii in eachindex(scores_th)
+            u =
+                xor(
+                    xor(base_u, UInt64(ii)),
+                    UInt64(Base.Threads.threadid()) % UInt64(1024) << 40,
+                )
+            thr_rng = Random.Xoshiro(u)
+            op_th[ii] = wsample(thr_rng, ops, wt)
+            ch_th[ii] =
+                crossover(task, na.params, nb.params, op_th[ii]; rng = thr_rng)
+            scores_th[ii] = offspring_metric_score!(
+                task,
+                ch_th[ii],
+                mwv,
+                env,
+                st,
+            )
+        end
+        for ii in eachindex(scores_th)
+            s = scores_th[ii]
+            if s < best_s
+                best_s = s
+                best_p = ch_th[ii]
+                best_op = op_th[ii]
+            end
+        end
+    else
+        for _ = 1:Nt
+            op = wsample(rng, ops, wt)
+            ch = crossover(task, na.params, nb.params, op; rng = rng)
+            sc = offspring_metric_score!(task, ch, mwv, env, st)
+            if sc < best_s
+                best_s = sc
+                best_p = ch
+                best_op = op
+            end
         end
     end
 

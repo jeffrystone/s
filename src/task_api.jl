@@ -17,8 +17,10 @@ supports_embed(::AbstractTask)::Bool = false
 embed(::AbstractTask, params::Dict{Symbol, Any})::Vector{Float64} =
     Float64[]
 
-generate_random_params(::AbstractTask, ::Vector{Scar}; kwargs...)::Dict{Symbol, Any} =
+generate_random_params(::AbstractTask, ::Vector{Scar}; rng::AbstractRNG = Random.default_rng(), shared_N::BigInt, extreme_seed_fraction::Float64 = 0.0)::Dict{Symbol, Any} =
     error("implement generate_random_params for concrete task")
+
+
 
 params_forbidden_by_scars(::AbstractTask, params::Dict{Symbol, Any}, scars::Vector{Scar})::Bool = false
 

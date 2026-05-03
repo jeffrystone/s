@@ -1,5 +1,6 @@
 using Test
 using Random
+using Statistics: mean
 using JSON3
 using StaticArrays: SA
 using Nodes
@@ -347,4 +348,167 @@ end
 
     rm(tune_dir_sl; recursive = true)
     rm(tune_dir_rf; recursive = true)
+end
+
+@testset "validate_environment!" begin
+    ta = PollardFactoringTask()
+    env = build_environment(ta, Settings(); N_init = 6, rng = MersenneTwister(901))
+    @test Nodes.validate_environment!(env)
+end
+
+@testset "MANUAL delete_node создаёт шрам если manual_delete_node_creates_scar" begin
+    st = Settings(; cold_start_ticks = 40, manual_delete_node_creates_scar = true)
+    ta = PollardFactoringTask()
+    rng = MersenneTwister(903)
+    env = build_environment(ta, st; N_init = 2, rng = rng)
+    nod = env.nodes[2]
+    n0 = length(env.scars)
+    put!(
+        env.manual_events,
+        Event(MANUAL; payload = Dict{Symbol,Any}(:action => :delete_node, :node_id => nod.id)),
+    )
+    drain_manual!(env, ta, st; rng = rng)
+    @test length(env.scars) == n0 + 1
+end
+
+@testset "Pollard generate_random_params с extreme_seed_fraction" begin
+    ta = PollardFactoringTask()
+    rng = MersenneTwister(904)
+    p = Nodes.generate_random_params(
+        ta,
+        Scar[];
+        rng = rng,
+        shared_N = BigInt(221),
+        extreme_seed_fraction = 1.0,
+    )
+    sx = Int(p[:start_x])
+    pc = Int(p[:poly_coeff])
+    @test (sx <= 128 || sx >= 99500) && (pc <= 40 || pc >= 920)
+end
+
+@testset "календарный ANALYSIS exclusive: первый такт только анализа" begin
+    st = Nodes.Settings(; cold_start_ticks = 120, analysis_interval = 40, analysis_calendar_exclusive_slot = true)
+    ta = Nodes.PollardFactoringTask(; l5_max_iter = 32)
+    rng = MersenneTwister(905)
+    env = Nodes.build_environment(ta, st; N_init = 6, rng = rng)
+    dlen0 = length(env.d_history)
+    Nodes.step!(env, ta, st; rng = rng)
+    @test UInt64(env.tick) == UInt64(1)
+    @test length(env.d_history) == dlen0 + 1
+end
+
+@testset "incremental_D_pollard эквивалентен полному скалярному скору D" begin
+    using LinearAlgebra: dot
+
+    ta = PollardFactoringTask(; l5_max_iter = 32)
+    st_inc = Settings(; incremental_D_pollard = true, cold_start_ticks = 200)
+    p = Dict{Symbol,Any}(:N => BigInt(221), :start_x => 91, :poly_coeff => 12)
+    n_inc = Node(UInt64(1), copy(p); hp = 80.0, mp = 40.0)
+    n_full = Node(UInt64(2), deepcopy(p); hp = 80.0, mp = 40.0)
+    Nodes.warm_start!(ta, n_inc, st_inc)
+    Nodes.warm_start!(ta, n_full, st_inc)
+    mw_full = Float64[w for w in st_inc.metric_weights]
+    k = 3
+    newv = 0.37
+    prevk = n_inc.metric_components[k]
+    n_inc.metric_components[k] = newv
+    n_full.metric_components[k] = newv
+    Nodes.finalize_metric_D!(ta, n_inc, mw_full, k, st_inc; prev_at_k = prevk)
+    n_full.D = clamp(dot(mw_full, n_full.metric_components), 0.0, 1.0)
+    @test n_inc.D ≈ n_full.D rtol = 1e-12 atol = 1e-14
+    @test n_inc.D ≈ dot(mw_full, n_inc.metric_components) rtol = 1e-12
+end
+
+@testset "повтор симуляции с одним RNG даёт одинаковый хвост" begin
+    function run_trace(master::UInt64)::Tuple{Int, UInt64, Float64}
+        ta = PollardFactoringTask(; l5_max_iter = 64)
+        st = Settings(; cold_start_ticks = 100)
+        rng = Random.Xoshiro(master)
+        env = build_environment(ta, st; rng = rng, N_init = 5, shared_N = BigInt(221))
+        meanD0::Float64 = isempty(env.nodes) ? 1.0 : mean(n.D for n in env.nodes)
+        tick0::UInt64 = env.tick
+        for _ = 1:72
+            step!(env, ta, st; rng = rng)
+        end
+        meanD::Float64 = isempty(env.nodes) ? meanD0 : mean(n.D for n in env.nodes)
+        tick1::UInt64 = env.tick
+        return (
+            isempty(env.nodes) ? Int(tick1) % 10007 : length(env.nodes),
+            tick1 - tick0,
+            meanD,
+        )
+    end
+
+    @test run_trace(UInt64(9_876_543)) == run_trace(UInt64(9_876_543))
+    @test run_trace(UInt64(9_876_543)) != run_trace(UInt64(9_876_544))
+end
+
+@testset "use_simulation_rng_seed задаёт сборку без учёта rng kwarg" begin
+    ta = PollardFactoringTask(; l5_max_iter = 32)
+    st = Settings(;
+        use_simulation_rng_seed = true,
+        simulation_rng_seed = UInt64(12_612_612),
+        cold_start_ticks = 50,
+        pollard_extreme_seed_fraction = 0.0,
+    )
+    e_bad = build_environment(ta, st; rng = MersenneTwister(1), N_init = 6, shared_N = BigInt(221))
+    e_good =
+        build_environment(ta, st; rng = MersenneTwister(9_009_009), N_init = 6, shared_N = BigInt(221))
+    sig(xs) =
+        sort!([
+            (Int(big(x.params[:start_x])), Int(big(x.params[:poly_coeff]))) for x in xs
+        ])
+    @test sig(e_bad.nodes) == sig(e_good.nodes)
+end
+
+@testset "resonance_initiator_hp_floor: низкий hp не даёт парт с RESONANCE" begin
+    st = Settings(; cold_start_ticks = 0, resonance_initiator_hp_floor = 500.0, default_hp = 120.0)
+    ta = PollardFactoringTask(; l5_max_iter = 32)
+    rng = MersenneTwister(12_081)
+    env = build_environment(ta, st; N_init = 6, shared_N = BigInt(221), rng = rng)
+    Nodes.rebuild_schedule!(env, ta, st; rng = rng)
+    rn = 0
+    while !isempty(env.event_queue)
+        pr = Base.popfirst!(env.event_queue)
+        ev, _ = pr.first
+        if ev.type === RESONANCE
+            rn += 1
+        end
+    end
+    @test rn == 0
+end
+
+@testset "MANUAL set_active отключает SHOT узла при ребилде" begin
+    st = Settings(; cold_start_ticks = 120)
+    ta = PollardFactoringTask(; l5_max_iter = 32)
+    rng = MersenneTwister(71_971)
+    env = build_environment(ta, st; N_init = 3, shared_N = BigInt(221), rng = rng)
+    nid = env.nodes[2].id
+    put!(
+        env.manual_events,
+        Event(MANUAL; payload = Dict{Symbol,Any}(:action => :set_active, :node_id => nid, :active => false)),
+    )
+    drain_manual!(env, ta, st; rng = rng)
+    Nodes.rebuild_schedule!(env, ta, st; rng = rng)
+    saw_n = false
+    while !isempty(env.event_queue)
+        pr = Base.popfirst!(env.event_queue)
+        ev, _ = pr.first
+        if ev.node_id === nid && ev.type === SHOT
+            saw_n = true
+            break
+        end
+    end
+    @test !saw_n
+end
+
+@testset "validate_environment! после симуляционных шагов" begin
+    ta = PollardFactoringTask(; l5_max_iter = 64)
+    st = Settings(; cold_start_ticks = 100)
+    rng = Random.Xoshiro(44_883)
+    env = build_environment(ta, st; N_init = 5, shared_N = BigInt(221), rng = rng)
+    for _ = 1:40
+        step!(env, ta, st; rng = rng)
+    end
+    @test Nodes.validate_environment!(env)
 end

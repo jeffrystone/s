@@ -12,6 +12,23 @@ function handle_manual!(
 
     if action === :delete_node
         nid = UInt64(get(pl, :node_id, UInt64(0)))
+        nd = fetch_node(env.nodes, nid)
+        if nd !== nothing && st.manual_delete_node_creates_scar
+            cen, rad, fv, dec = failure_scar_meta(task, nd.params)
+            push!(
+                env.scars,
+                Scar(
+                    env.next_scar_id,
+                    cen,
+                    rad,
+                    1.0,
+                    fv,
+                    dec,
+                    UInt64(env.tick),
+                ),
+            )
+            env.next_scar_id += UInt64(1)
+        end
         filter!(n -> n.id != nid, env.nodes)
     elseif action === :force_resonance
         a = UInt64(get(pl, :node_a, UInt64(0)))
@@ -32,6 +49,11 @@ function handle_manual!(
     elseif action === :clear_scar
         sid = UInt64(get(pl, :scar_id, UInt64(0)))
         filter!(s -> s.id != sid, env.scars)
+    elseif action === :set_active
+        nid = UInt64(get(pl, :node_id, UInt64(0)))
+        act = Bool(get(pl, :active, true))
+        nd = fetch_node(env.nodes, nid)
+        nd !== nothing && (nd.active = act)
     elseif action === :set_mp_frozen
         nid = UInt64(get(pl, :node_id, UInt64(0)))
         fr = Bool(get(pl, :frozen, true))
@@ -59,7 +81,13 @@ function handle_manual!(
         sh =
             isempty(env.nodes) ? big(221) :
             big(get(env.nodes[1].params, :N, BigInt(221)))
-        base_p = generate_random_params(task, env.scars; rng = rng, shared_N = sh)
+        base_p = generate_random_params(
+            task,
+            env.scars;
+            rng = rng,
+            shared_N = sh,
+            extreme_seed_fraction = st.pollard_extreme_seed_fraction,
+        )
         pr = get(pl, :params, base_p)
         pr = pr isa Dict{Symbol, Any} ? pr : base_p
         hp = Float64(get(pl, :hp, st.default_hp))
