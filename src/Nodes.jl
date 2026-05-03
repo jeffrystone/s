@@ -36,7 +36,10 @@ export Node,
        greet,
        push_metric_l34_pair!,
        maybe_calibration_l34_weights!,
-       drain_manual!
+       drain_manual!,
+       save_attention_tune,
+       load_attention_tune!,
+       maybe_save_attention_tune!
 
 include("types.jl")
 include("config.jl")
@@ -45,6 +48,7 @@ include("task_api.jl")
 
 include(joinpath("tasks", "pollard.jl"))
 
+include("attention_persist.jl")
 include("engine.jl")
 include("snapshot.jl")
 include("serve.jl")

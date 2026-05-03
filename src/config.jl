@@ -37,4 +37,27 @@ Base.@kwdef mutable struct Settings
     analysis_calibration_eta::Float64 = 0.06
     analysis_calibration_corr_strong::Float64 = 0.35
     analysis_calibration_gap_threshold::Float64 = 0.08
+    crossover_learning_enabled::Bool = true
+    crossover_learning_eta::Float64 = 0.04
+    attention_suffer_gamma::Float64 = 1.35
+    resonance_offspring_two_stage::Bool = false
+    resonance_two_stage_L1_gate::Float64 = 0.95
+    analysis_priority_force_high::Bool = false
+    analysis_priority_floor::Float64 = 920.0
+    appeal_extend_L2_vs_L3::Bool = false
+    appeal_l2_vs_l3_min_gap::Float64 = 0.16
+    calibration_extra_node_samples::Bool = false
+    calibration_extra_nodes_per_analysis::Int = 8
+    recent_events_max::Int = 96
+    parallel_offspring::Bool = true
+    parallel_offspring_min_trials::Int = 12
+    scar_kdtree_min::Int = 16
+    """Путь к JSON для сохранения `attention_tune_*` (`nothing` = не сохранять)."""
+    attention_tune_persist_path::Union{Nothing,String} = nothing
+    """Условное усиление внимания после MANUAL `force_resonance`, если ребёнок лучше родителей."""
+    manual_win_tune_enabled::Bool = true
+    """Мультипликатор: `attention_tune_gamma *= (1 + eta)` при успехе (и по флагу ниже alpha/beta)."""
+    manual_win_tune_eta::Float64 = 0.02
+    """Если false — умножаются все три множителя `attention_tune_*`."""
+    manual_win_tune_gamma_only::Bool = true
 end

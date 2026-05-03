@@ -2,7 +2,7 @@ using Random
 using LinearAlgebra: dot, norm
 using Statistics: mean, cor, std
 using DataStructures: isempty, PriorityQueue
-using NearestNeighbors: KDTree, knn
+using NearestNeighbors: KDTree, knn, inrange
 
 """Planner and simulation helpers (cold start, shots, resonance, analysis). ASCII comments."""
 const _LEVELS = (L1, L2, L3, L4, L5)
@@ -125,28 +125,68 @@ function maybe_calibration_l34_weights!(env::Environment, st::Settings)
     sm > 0 && (nw ./= sm)
 end
 
-function strong_scar_near(task::AbstractTask, env::Environment, node::Node)
+function strong_scar_near(task::AbstractTask, env::Environment, node::Node, st::Settings)
     supports_embed(task) || return false
     evec = embed(task, node.params)
     isempty(evec) && return false
+    dlen = length(evec)
     tn = UInt64(env.tick)
+
+    filt = Scar[]
     for s in env.scars
         scar_potential(s, tn) < 0.25 && continue
-        ce = zeros(length(evec))
+        push!(filt, s)
+    end
+    isempty(filt) && return false
+
+    function cen(s::Scar)::Vector{Float64}
+        ce = zeros(Float64, dlen)
         for (k, vv) in s.center
-            if k == :start_x && length(ce) >= 1
+            if k == :start_x && dlen >= 1
                 ce[1] = Float64(vv) / 1000
-            elseif k == :poly_coeff && length(ce) >= 2
+            elseif k == :poly_coeff && dlen >= 2
                 ce[2] = Float64(vv) / 1000
             end
         end
-        norm(evec - ce) <= s.radius && return true
+        return ce
     end
-    false
+
+    function brute_near()::Bool
+        for s in filt
+            norm(evec - cen(s)) <= s.radius && return true
+        end
+        return false
+    end
+
+    if length(filt) < st.scar_kdtree_min
+        return brute_near()
+    end
+
+    pts = zeros(Float64, dlen, length(filt))
+    Rmax::Float64 = maximum(s.radius for s in filt; init = 0.05)
+    for i in eachindex(filt)
+        pts[:, i] = cen(filt[i])
+    end
+    tree = KDTree(pts)
+    cand = inrange(tree, evec, Rmax, false)
+    for ix in cand
+        s = filt[ix]
+        norm(evec - pts[:, ix]) <= s.radius && return true
+    end
+    return false
 end
 
 res_candidates(env::Environment, nid::UInt64) =
     UInt64[m.id for m in env.nodes if m.id != nid && m.mp > 0]
+
+function record_recent_event!(env::Environment, st::Settings, payload::Dict{Symbol, Any})
+    push!(env.recent_events, copy(payload))
+    cap = max(4, st.recent_events_max)
+    while length(env.recent_events) > cap
+        popfirst!(env.recent_events)
+    end
+    return nothing
+end
 
 function fetch_node(nodes::Vector{Node}, id::UInt64)
     i = findfirst(n -> n.id == id, nodes)
@@ -167,13 +207,17 @@ function pick_partner(task::AbstractTask, env::Environment, a::UInt64, cand::Vec
         nb === nothing && continue
         key = (min(a, bid), max(a, bid))
         mem = get(env.resonance_memory, key, 0.35)
-        dmem = st.attention_gamma * (1 - clamp(mem, 0.0, 1.0))
+        dmem =
+            st.attention_gamma *
+            env.attention_tune_gamma *
+            (1 - clamp(mem, 0.0, 1.0))
         dist =
-            use_emb && !isempty(va) ? st.attention_alpha * norm(va - embed(task, nb.params)) :
+            use_emb && !isempty(va) ? st.attention_alpha * env.attention_tune_alpha * norm(va - embed(task, nb.params)) :
             rand(rng)
-        suf = rand(rng) * st.attention_beta
+        suf = rand(rng) * st.attention_beta * env.attention_tune_beta
         jitter = randn(rng) * n_amp * 0.15 * (env.stuck_counter > 0 ? st.resonance_stuck_jitter_amp : 1.0)
-        sc = dist + suf + dmem + jitter
+        suffer = st.attention_suffer_gamma * env.attention_tune_gamma * abs(suffering_profile(na) - suffering_profile(nb))
+        sc = dist + suf + dmem + jitter + suffer
         if sc < bests
             bests = sc
             best = bid
@@ -226,6 +270,28 @@ function offspring_n(hpA::Float64, mpB::Float64)::Int
     clamp(round(Int, log(2 + hpA) * sqrt(max(mpB, 0.01))), 1, 36)
 end
 
+const _MATING_HIST_MAX = 64
+
+function push_mating_history_safe!(nod::Node, mate::UInt64, q::Float64)
+    push!(nod.mating_history, (mate, q))
+    while length(nod.mating_history) > _MATING_HIST_MAX
+        popfirst!(nod.mating_history)
+    end
+    return nothing
+end
+
+"""Heuristic aligned with AGENTS (suffering_similarity): похожий pain → меньший штраф в pick_partner."""
+function suffering_profile(node::Node)::Float64
+    nfail = isempty(node.heavy_shots) ? 0 : count(x -> !x[2], node.heavy_shots)
+    failrate = isempty(node.heavy_shots) ? 0.0 : nfail / length(node.heavy_shots)
+    mh = node.D
+    if !isempty(node.mutation_history)
+        lo = max(1, length(node.mutation_history) - 5)
+        mh = mean(Float64[t[2] for t in @view(node.mutation_history[lo:end])])
+    end
+    clamp(node.D + 0.22 * failrate + 0.12 * mh, 0.0, 3.5)
+end
+
 function ll_score(task::AbstractTask, ch::Dict{Symbol, Any}, mw::Vector{Float64}, env::Environment, st::Settings)::Float64
     r1, _ = eval_maybe_cached(task, env, st, ch, L1)
     r2, _ = eval_maybe_cached(task, env, st, ch, L2)
@@ -233,8 +299,31 @@ function ll_score(task::AbstractTask, ch::Dict{Symbol, Any}, mw::Vector{Float64}
     return mw[1] * normalize(task, L1, r1) + mw[2] * normalize(task, L2, r2)
 end
 
+"""Two-stage offspring filter: discard before L2 if normalized L1 is above gate."""
+function offspring_metric_score!(
+    task::AbstractTask,
+    ch::Dict{Symbol, Any},
+    mw::Vector{Float64},
+    env::Environment,
+    st::Settings,
+)::Float64
+    if !st.resonance_offspring_two_stage
+        return ll_score(task, ch, mw, env, st)
+    end
+    r1, _ = eval_maybe_cached(task, env, st, ch, L1)
+    n1 = normalize(task, L1, r1)
+    if n1 > st.resonance_two_stage_L1_gate
+        delete!(ch, :_factor)
+        return Inf
+    end
+    r2, _ = eval_maybe_cached(task, env, st, ch, L2)
+    delete!(ch, :_factor)
+    return mw[1] * n1 + mw[2] * normalize(task, L2, r2)
+end
+
 function resonance_pr(env::Environment, st::Settings, a::UInt64, b::UInt64)::Float64
-    st.attention_gamma * 0.65 * get(env.resonance_memory, (min(a, b), max(a, b)), 0.35)
+    st.attention_gamma * env.attention_tune_gamma * 0.65 *
+    get(env.resonance_memory, (min(a, b), max(a, b)), 0.35)
 end
 
 """Scar rupture when D < 0.2 in scar region."""
@@ -344,6 +433,22 @@ function analysis_pass!(env::Environment, task::AbstractTask, st::Settings; rng:
         sm = sum(mw)
         sm > 0 && (mw ./= sm)
     end
+
+    if st.calibration_extra_node_samples &&
+       length(env.nodes) >= 2 &&
+       rand(rng) < 0.35
+        for _ = 1:max(1, div(st.calibration_extra_nodes_per_analysis, 4))
+            nidx = rand(rng, axes(env.nodes, 1))
+            n = env.nodes[nidx]
+            p0 = Dict{Symbol, Any}(pairs(n.params))
+            r3, _ = evaluate(task, p0, L3)
+            n_pred = normalize(task, L3, r3)
+            r4, _ = evaluate(task, p0, L4)
+            nf = normalize(task, L4, r4)
+            push_metric_l34_pair!(env, st, Float64(n_pred), Float64(nf))
+            delete!(n.params, :_factor)
+        end
+    end
 end
 
 function rebuild_schedule!(
@@ -369,11 +474,10 @@ function rebuild_schedule!(
     end
 
     if env.tick > 0 && env.tick % st.analysis_interval == 0
-        enqueue_evt!(
-            env,
-            Event(ANALYSIS),
-            Float64(st.analysis_priority_quantum),
-        )
+        apr =
+            st.analysis_priority_force_high ? Float64(st.analysis_priority_floor) :
+            Float64(st.analysis_priority_quantum)
+        enqueue_evt!(env, Event(ANALYSIS), apr)
     end
 
     for na in env.nodes
@@ -381,15 +485,16 @@ function rebuild_schedule!(
 
         lk = choose_shot_level(na, st, cold)
         if lk !== nothing
-            ik = level_index(lk)
-            pr = (1.0 - clamp(na.D, 0.0, 1.0)) * max(na.hp, 1e-6) * mw[ik]
-            enqueue_evt!(env, Event(SHOT; node_id = na.id), pr)
+            ik = UInt8(level_index(lk))
+            ikp = Int(ik)
+            pr = (1.0 - clamp(na.D, 0.0, 1.0)) * max(na.hp, 1e-6) * mw[ikp]
+            enqueue_evt!(env, Event(SHOT; node_id = na.id, shot_level_idx = ik), pr)
         end
 
         if !cold &&
            na.hp >= st.heavy_shot_hp_min &&
            na.D <= st.D_thresh_heavy &&
-           !strong_scar_near(task, env, na)
+           !strong_scar_near(task, env, na, st)
             prh =
                 (1.0 - clamp(na.D, 0.0, 1.0)) *
                 max(na.hp, 1e-6) *
@@ -443,8 +548,20 @@ function handle_shot!(env::Environment, task::AbstractTask, st::Settings, ev::Ev
     cold = env.tick < st.cold_start_ticks
     na = fetch_node(env.nodes, ev.node_id)
     na === nothing && return
-    lk = choose_shot_level(na, st, cold)
+
+    lk::Union{Nothing, Type{<:MetricLevel}} =
+        ev.shot_level_idx != UInt8(0) ? begin
+            ix = Int(ev.shot_level_idx)
+            (ix >= 1 && ix <= 5) ? _LEVELS[ix] : nothing
+        end : choose_shot_level(na, st, cold)
     lk === nothing && return
+
+    pred_L2_app =
+        (lk <: L3 && !cold && st.appeal_extend_L2_vs_L3) ? begin
+            p0 = Dict{Symbol, Any}(pairs(na.params))
+            r2, _ = evaluate(task, p0, L2)
+            normalize(task, L2, r2)
+        end : nothing
 
     n_pred =
         lk <: L4 && !cold ? begin
@@ -464,8 +581,37 @@ function handle_shot!(env::Environment, task::AbstractTask, st::Settings, ev::Ev
     end
     k = level_index(lk)
     na.hp = max(0.0, na.hp - effcost(st, k, cold))
+    lk <: L3 && appeal_post_l23!(env, na, st, cold, pred_L2_app)
     lk <: L4 && appeal_post_l4!(task, env, na, st, cold, n_pred)
     rupture_scars!(env, task, na, st)
+end
+
+"""Пара L2-vs-L3: дёшевый прогноз «хорошо», факт метрики L3 резко хуже (итер. 2 расширение §4.2)."""
+function appeal_post_l23!(
+    env::Environment,
+    na::Node,
+    st::Settings,
+    cold::Bool,
+    pred_L2::Union{Nothing, Float64},
+)
+    cold && return
+    pred_L2 === nothing && return
+    fact = Float64(na.metric_components[3])
+    pred_L2 > st.appeal_l3_threshold && return
+    fact < st.appeal_l4_threshold && return
+    gap = fact - pred_L2
+    gap < st.appeal_l2_vs_l3_min_gap && return
+
+    mw = env.metric_weights
+    if gap >= 0.4 && mw[2] > 1e-3
+        mw[2] = max(0.0, mw[2] * 0.96)
+        s = sum(mw)
+        s > 0 && (mw ./= s)
+        na.hp = max(0.0, na.hp - st.appeal_hp_cost_light)
+    else
+        na.hp = max(0.0, na.hp - st.appeal_hp_cost_light * 0.6)
+    end
+    return nothing
 end
 
 """Расхождение L3-vs-L4 после L4 (агент §4.2)."""
@@ -524,7 +670,7 @@ function handle_heavy_shot!(env::Environment, task::AbstractTask, st::Settings, 
     na === nothing && return
     na.hp >= st.heavy_shot_hp_min || return
     na.D <= st.D_thresh_heavy || return
-    strong_scar_near(task, env, na) && return
+    strong_scar_near(task, env, na, st) && return
 
     D0 = na.D
     raw, ok = evaluate(task, na.params, L5)
@@ -563,7 +709,7 @@ function perform_resonance_between!(
     na::Node,
     nb::Node,
     rng::AbstractRNG,
-)::Nothing
+)::Union{Nothing,Bool}
     ops =
         isempty(env.crossover_weights) ? [:swap_start, :swap_coeff, :average, :random_mid] :
         Symbol[k for (k, _) in env.crossover_weights]
@@ -574,21 +720,52 @@ function perform_resonance_between!(
     mw = env.metric_weights
     Noffs = offspring_n(Float64(na.hp), Float64(nb.mp))
 
+    winner_op::Symbol = ops[1]
     best::Union{Nothing, Dict{Symbol, Any}} = nothing
     best_score = Inf
 
-    for _ = 1:Noffs
-        op = wsample(rng, ops, wt)
-        ch = crossover(task, na.params, nb.params, op; rng = rng)
-        params_forbidden_by_scars(task, ch, env.scars) && continue
-        chi = Dict{Symbol, Any}(pairs(ch))
-        sc = ll_score(task, chi, mw, env, st)
-        if sc < best_score
-            best_score = sc
-            best = chi
+    use_thr =
+        st.parallel_offspring && Threads.nthreads() > 1 && !st.evaluate_cache_enabled &&
+        Noffs >= st.parallel_offspring_min_trials
+
+    if use_thr
+        tuples = Vector{Tuple{Float64, Dict{Symbol, Any}, Symbol}}(undef, Noffs)
+        seeds::Vector{UInt64} = [rand(rng, UInt64) ⊻ UInt64(i) for i = 1:Noffs]
+        Threads.@threads for i = 1:Noffs
+            rloc = Random.MersenneTwister(seeds[i] ⊻ UInt64(Threads.threadid()))
+            local_op::Symbol = wsample(rloc, ops, wt)
+            local_ch = crossover(task, na.params, nb.params, local_op; rng = rloc)
+            if params_forbidden_by_scars(task, local_ch, env.scars)
+                tuples[i] = (Inf, Dict{Symbol, Any}(), local_op)
+                continue
+            end
+            chi = Dict{Symbol, Any}(pairs(local_ch))
+            sc = offspring_metric_score!(task, chi, mw, env, st)
+            tuples[i] = (Float64(sc), chi, local_op)
+        end
+        for i = 1:Noffs
+            sc, chi, local_op = tuples[i]
+            if sc < best_score
+                best_score = sc
+                best = chi
+                winner_op = local_op
+            end
+        end
+    else
+        for _ = 1:Noffs
+            op = wsample(rng, ops, wt)
+            ch = crossover(task, na.params, nb.params, op; rng = rng)
+            params_forbidden_by_scars(task, ch, env.scars) && continue
+            chi = Dict{Symbol, Any}(pairs(ch))
+            sc = offspring_metric_score!(task, chi, mw, env, st)
+            if sc < best_score
+                best_score = sc
+                best = chi
+                winner_op = op
+            end
         end
     end
-    best === nothing && return
+    best === nothing && return nothing
 
     na.mp = max(0.0, na.mp - 6.0)
     nb.mp = max(0.0, nb.mp - 10.0)
@@ -601,6 +778,9 @@ function perform_resonance_between!(
 
     warm_start!(task, ch_node, st)
     push!(env.nodes, ch_node)
+
+    push_mating_history_safe!(na, nb.id, Float64(best_score))
+    push_mating_history_safe!(nb, na.id, Float64(best_score))
 
     tax = clamp(10.0 * (1.0 - clamp(ch_node.D, 0.0, 1.0)), 1.5, 30.0)
     ch_node.hp = max(0.0, ch_node.hp - tax)
@@ -622,7 +802,23 @@ function perform_resonance_between!(
     else
         env.resonance_memory[rk] = clamp(mv - 0.04, 0.0, 1.0)
     end
-    return
+
+    if st.crossover_learning_enabled
+        η = st.crossover_learning_eta
+        cw = env.crossover_weights
+        for op in ops
+            get!(cw, op, 1.0)
+        end
+        boost = improving ? η : η * 0.35
+        cw[winner_op] = max(1e-3, cw[winner_op] * (1.0 + boost))
+        s = Float64(sum(values(cw)))
+        if s > 0
+            for k in keys(cw)
+                cw[k] /= s
+            end
+        end
+    end
+    return improving
 end
 
 function handle_resonance!(
@@ -655,6 +851,13 @@ function handle_manual!(
 )
     pl = ev.payload
     act = Symbol(get(pl, :action, :noop))
+
+    let ad = Dict{Symbol, Any}(:tick_sim => env.tick, :action => string(act))
+        push!(env.manual_audit, ad)
+        while length(env.manual_audit) > 256
+            popfirst!(env.manual_audit)
+        end
+    end
 
     function as_u64(x)::UInt64
         x isa UInt64 && return x
@@ -716,7 +919,19 @@ function handle_manual!(
         na.hp > 0.5 || return
         na.mp > 0 || return
         nb.mp > 0 || return
-        perform_resonance_between!(env, task, st, na, nb, rng)
+        r = perform_resonance_between!(env, task, st, na, nb, rng)
+        if r isa Bool
+            env.manual_audit[end][:child_improved] = r
+        end
+        if r === true && st.manual_win_tune_enabled
+            m::Float64 = 1.0 + st.manual_win_tune_eta
+            env.attention_tune_gamma = clamp(env.attention_tune_gamma * m, 0.2, 6.0)
+            if !st.manual_win_tune_gamma_only
+                env.attention_tune_alpha = clamp(env.attention_tune_alpha * m, 0.2, 6.0)
+                env.attention_tune_beta = clamp(env.attention_tune_beta * m, 0.2, 6.0)
+            end
+            maybe_save_attention_tune!(env, st)
+        end
         return
     end
 
@@ -733,6 +948,32 @@ function handle_manual!(
         j = Int(ix)
         (j < 1 || j > length(env.scars)) && return
         deleteat!(env.scars, j)
+        return
+    end
+
+    if act === :resume
+        env.paused = false
+        return
+    end
+
+    if act === :pause || act === :set_paused
+        env.paused = Bool(get(pl, :paused, true))
+        return
+    end
+
+    if act === :reference_pair
+        va = get(pl, :node_a, nothing)
+        vb = get(pl, :node_b, nothing)
+        (va === nothing || vb === nothing) && return
+        ida = as_u64(va)
+        idb = as_u64(vb)
+        fetch_node(env.nodes, ida) === nothing && return
+        fetch_node(env.nodes, idb) === nothing && return
+        env.attention_tune_alpha = clamp(env.attention_tune_alpha * Float64(get(pl, :boost_alpha, 1.035)), 0.2, 6.0)
+        env.attention_tune_beta = clamp(env.attention_tune_beta * Float64(get(pl, :boost_beta, 1.045)), 0.2, 6.0)
+        env.attention_tune_gamma =
+            clamp(env.attention_tune_gamma * Float64(get(pl, :boost_gamma, 1.04)), 0.2, 6.0)
+        maybe_save_attention_tune!(env, st)
         return
     end
 
@@ -765,6 +1006,9 @@ function step!(env::Environment, task::AbstractTask, st::Settings; rng::Abstract
     env.stop_reason == :factor_found && return env
 
     drain_manual!(env, task, st; rng)
+
+    env.paused && return env
+
     rebuild_schedule!(env, task, st; rng)
 
     if isempty(env.event_queue)
@@ -776,8 +1020,10 @@ function step!(env::Environment, task::AbstractTask, st::Settings; rng::Abstract
     ev, _ = pr.first
 
     t0 = time()
+    lvl = UInt8(0)
     if ev.type == SHOT
         handle_shot!(env, task, st, ev)
+        lvl = ev.shot_level_idx
     elseif ev.type == HEAVY_SHOT
         handle_heavy_shot!(env, task, st, ev)
     elseif ev.type == RESONANCE
@@ -793,6 +1039,15 @@ function step!(env::Environment, task::AbstractTask, st::Settings; rng::Abstract
     if ev.node_id != UInt64(0)
         env.per_node_time_s[ev.node_id] = get(env.per_node_time_s, ev.node_id, 0.0) + dt
     end
+
+    rec = Dict{Symbol, Any}(
+        :tick_sim => UInt64(env.tick),
+        :type => Symbol(ev.type),
+        :node_id => ev.node_id,
+        :partner_id => ev.partner_id,
+        :shot_level => Int(lvl),
+    )
+    record_recent_event!(env, st, rec)
 
     env.tick += UInt64(1)
 
@@ -858,6 +1113,12 @@ function build_environment(
         UInt64(1),
         Float64[],
         Float64[],
+        Dict{Symbol, Any}[],
+        Dict{Symbol, Any}[],
+        1.0,
+        1.0,
+        1.0,
+        false,
     )
 
     env

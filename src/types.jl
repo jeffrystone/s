@@ -23,6 +23,8 @@ struct Event
     priority::Float64
     manual::Bool
     payload::Dict{Symbol, Any}
+    """0 = уровень SHOT выбирается в `handle_shot!`; иначе 1..5 = фиксированный L-класс индекс."""
+    shot_level_idx::UInt8
 end
 
 function Event(
@@ -32,8 +34,9 @@ function Event(
     priority::Float64 = 0.0,
     manual::Bool = false,
     payload::Dict{Symbol, Any} = Dict{Symbol, Any}(),
+    shot_level_idx::UInt8 = UInt8(0),
 )
-    Event(t, node_id, partner_id, priority, manual, payload)
+    Event(t, node_id, partner_id, priority, manual, payload, shot_level_idx)
 end
 
 mutable struct Node
@@ -99,6 +102,16 @@ mutable struct Environment
     next_scar_id::UInt64
     metric_l34_n3::Vector{Float64}
     metric_l34_n4::Vector{Float64}
+    """Кольцо записей последних событий для клиента §9."""
+    recent_events::Vector{Dict{Symbol, Any}}
+    """Журнал MANUAL для §9.8 (audit)."""
+    manual_audit::Vector{Dict{Symbol, Any}}
+    """Эффективное масштабирование внимания (MANUAL reference_pair умножает)."""
+    attention_tune_alpha::Float64
+    attention_tune_beta::Float64
+    attention_tune_gamma::Float64
+    """Пауза симуляции (MANUAL / UI)."""
+    paused::Bool
 end
 
 """Индекс 1..5 для весов метрик (L1..L5)."""
